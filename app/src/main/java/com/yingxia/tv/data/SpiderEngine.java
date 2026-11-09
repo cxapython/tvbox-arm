@@ -1,0 +1,452 @@
+package com.yingxia.tv.data;
+
+import android.content.*;
+import com.github.catvod.crawler.Spider;
+import com.yingxia.tv.*;
+import com.yingxia.tv.core.*;
+import com.yingxia.tv.runtime.*;
+import dalvik.system.DexClassLoader;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.*;
+import java.util.zip.*;
+import org.json.*;
+import org.xmlpull.v1.*;
+
+public final class SpiderEngine {
+  private final Context context;
+  private final Http http;
+  private final Map<String, Spider> jarSpiders = new java.util.concurrent.ConcurrentHashMap<>();
+  private final Map<Session, Integer> activeSessions = new java.util.IdentityHashMap<>();
+  private final Map<String, Session> sessions = new LinkedHashMap<>(4, .75f, true);
+
+  private interface Session {
+    JSONObject call(JSONObject params) throws Exception;
+
+    default void close() {}
+  }
+
+  public SpiderEngine(Context context) {
+    this.context = context;
+    http = YingxiaApp.get().http;
+  }
+
+  public JSONObject call(JSONObject site, JSONObject params) throws Exception {
+    Session session;
+    synchronized (sessions) {
+      String id = site.optString("id");
+      session = sessions.get(id);
+      if (session == null) {
+        session = open(site);
+        sessions.put(id, session);
+      }
+      activeSessions.put(session, activeSessions.getOrDefault(session, 0) + 1);
+    }
+    try {
+      synchronized (session) {
+        JSONObject result = session.call(params);
+        if (result.has("error")) throw new IOException(result.optString("error"));
+        return result;
+      }
+    } finally {
+      synchronized (sessions) {
+        int refs = activeSessions.getOrDefault(session, 1) - 1;
+        if (refs == 0) {
+          activeSessions.remove(session);
+          if (!sessions.containsValue(session)) session.close();
+        } else activeSessions.put(session, refs);
+        if (sessions.size() > 3) {
+          Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator();
+          while (it.hasNext() && sessions.size() > 3) {
+            Session old = it.next().getValue();
+            if (!activeSessions.containsKey(old)) {
+              it.remove();
+              old.close();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  public Object[] proxy(String key, Map<String, String> params) throws Exception {
+    Spider spider = jarSpiders.get(key);
+    if (spider == null) throw new IOException("Source proxy unavailable");
+    return spider.proxy(params);
+  }
+
+  public void clear() {
+    synchronized (sessions) {
+      for (Session s : sessions.values()) if (!activeSessions.containsKey(s)) s.close();
+      sessions.clear();
+    }
+  }
+
+  private Session open(JSONObject raw) throws Exception {
+    JSONObject site = Json.copy(raw);
+    String api = site.optString("api"), origin = site.optString("origin");
+    int type = site.optInt("type", 1);
+    if ((type == 0 || type == 1 || type == 4) && !api.startsWith("csp_"))
+      return params -> api(site, params);
+    if (api.startsWith("csp_")) {
+      // Use the exact lightweight ports shared with the Apple app where possible.
+      try (InputStream in = context.getAssets().open("scripts/sites/index.json")) {
+        JSONObject index = new JSONObject(new String(read(in, 200000), StandardCharsets.UTF_8));
+        String key = api.substring(4);
+        Object mapping = Json.child(index, "classes").opt(key);
+        String mapped =
+            mapping instanceof String
+                ? (String) mapping
+                : mapping instanceof JSONObject ? ((JSONObject) mapping).optString("script") : "";
+        if (!mapped.isEmpty()) {
+          JSONObject jarSite = Json.copy(site);
+          site.put("api", mapped.startsWith("assets:") ? mapped : "assets://sites/" + mapped);
+          Session lightweight;
+          try {
+            lightweight = script(site);
+          } catch (Exception e) {
+            if (jarSite.optString("jar", jarSite.optString("spider")).isEmpty()) throw e;
+            return jar(jarSite);
+          }
+          if (jarSite.optString("jar", jarSite.optString("spider")).isEmpty()) return lightweight;
+          return new Session() {
+            private Session fallback;
+
+            public JSONObject call(JSONObject params) throws Exception {
+              if (fallback != null) return fallback.call(params);
+              try {
+                JSONObject answer = lightweight.call(params);
+                if (answer.has("error")) throw new IOException(answer.optString("error"));
+                return answer;
+              } catch (Exception original) {
+                try {
+                  fallback = jar(jarSite);
+                  return fallback.call(params);
+                } catch (Exception error) {
+                  error.addSuppressed(original);
+                  throw error;
+                }
+              }
+            }
+
+            public void close() {
+              lightweight.close();
+              if (fallback != null) fallback.close();
+            }
+          };
+        }
+      } catch (JSONException ignored) {
+      }
+      return jar(site);
+    }
+    if (api.toLowerCase(Locale.ROOT).contains(".py"))
+      throw new IOException("此源需要 Python 运行时，请选用它的 JSON、JS 或 JAR 版本");
+    site.put("api", ConfigCodec.address(api, origin));
+    return script(site);
+  }
+
+  private Session script(JSONObject site) throws Exception {
+    ScriptRuntime runtime =
+        new ScriptRuntime(context, site.optString("id"), site.optString("origin"));
+    try {
+      runtime.initSpider(site);
+    } catch (Exception e) {
+      runtime.close();
+      throw e;
+    }
+    return new Session() {
+      public JSONObject call(JSONObject p) throws Exception {
+        return runtime.spider(p);
+      }
+
+      public void close() {
+        runtime.close();
+      }
+    };
+  }
+
+  private JSONObject api(JSONObject site, JSONObject p) throws Exception {
+    String api = ConfigCodec.address(site.optString("api"), site.optString("origin"));
+    Map<String, String> query = new LinkedHashMap<>();
+    for (String key : Json.keys(p)) query.put(key, p.optString(key));
+    if (p.has("ids")) query.put("ac", "detail");
+    else if (p.has("wd")) query.put("ac", "detail");
+    else if (p.has("t")) query.put("ac", "detail");
+    if (site.optInt("type") == 4) {
+      query.put("filter", "true");
+      if (p.has("t")) query.put("ac", "detail");
+      if (site.has("ext")) query.put("ext", site.optString("ext"));
+    }
+    Http.Result r = http.get(Http.query(api, query), Json.headers(site.optJSONObject("header")));
+    return r.text().trim().startsWith("<") ? xml(r.text()) : new JSONObject(r.text());
+  }
+
+  private JSONObject xml(String text) throws Exception {
+    XmlPullParser parser = XmlPullParserFactory.newInstance().newPullParser();
+    parser.setInput(new StringReader(text));
+    JSONObject out = Json.obj("class", new JSONArray(), "list", new JSONArray());
+    JSONObject video = null;
+    String tag = "", flag = "";
+    StringBuilder value = new StringBuilder();
+    List<String> flags = new ArrayList<>(), plays = new ArrayList<>();
+    for (int event = parser.getEventType();
+        event != XmlPullParser.END_DOCUMENT;
+        event = parser.next()) {
+      if (event == XmlPullParser.START_TAG) {
+        tag = parser.getName();
+        value.setLength(0);
+        if (tag.equals("list")) {
+          out.put("page", parser.getAttributeValue(null, "page"))
+              .put("pagecount", parser.getAttributeValue(null, "pagecount"));
+        }
+        if (tag.equals("video")) {
+          video = new JSONObject();
+          flags.clear();
+          plays.clear();
+        }
+        if (tag.equals("dd")) flag = parser.getAttributeValue(null, "flag");
+        if (tag.equals("ty")) flag = parser.getAttributeValue(null, "id");
+      } else if (event == XmlPullParser.TEXT) value.append(parser.getText());
+      else if (event == XmlPullParser.END_TAG) {
+        String name = parser.getName(), s = value.toString();
+        if (name.equals("ty"))
+          out.getJSONArray("class").put(Json.obj("type_id", flag, "type_name", s));
+        if (video != null) {
+          Map<String, String> names =
+              Http.params(
+                  "id",
+                  "vod_id",
+                  "name",
+                  "vod_name",
+                  "pic",
+                  "vod_pic",
+                  "note",
+                  "vod_remarks",
+                  "des",
+                  "vod_content",
+                  "year",
+                  "vod_year",
+                  "actor",
+                  "vod_actor",
+                  "director",
+                  "vod_director",
+                  "type",
+                  "type_name");
+          if (names.containsKey(name)) video.put(names.get(name), s);
+          if (name.equals("dd")) {
+            flags.add(flag == null ? "" : flag);
+            plays.add(s);
+          }
+          if (name.equals("video")) {
+            video
+                .put("vod_play_from", String.join("$$$", flags))
+                .put("vod_play_url", String.join("$$$", plays));
+            out.getJSONArray("list").put(video);
+            video = null;
+          }
+        }
+        value.setLength(0);
+      }
+    }
+    return out;
+  }
+
+  private Session jar(JSONObject site) throws Exception {
+    String address = site.optString("jar", site.optString("spider"));
+    if (address.isEmpty()) throw new IOException("订阅未提供此源的 JAR 插件");
+    String[] location = address.split(";md5;", 2);
+    String url = ConfigCodec.address(location[0], site.optString("origin"));
+    File root = new File(context.getCodeCacheDir(), "plugins/" + ConfigCodec.hash(url));
+    if (!root.exists() && !root.mkdirs()) throw new IOException("无法创建插件目录");
+    File archive = new File(root, "plugin.jar");
+    if (!archive.exists()) {
+      byte[] data = http.get(url).bytes;
+      if (location.length == 2
+          && !ConfigCodec.hex(MessageDigest.getInstance("MD5").digest(data))
+              .equalsIgnoreCase(location[1])) throw new IOException("插件 MD5 校验失败");
+      try (FileOutputStream out = new FileOutputStream(archive)) {
+        out.write(data);
+      }
+      archive.setReadOnly();
+    }
+    boolean dex = false;
+    try (ZipFile zip = new ZipFile(archive)) {
+      Enumeration<? extends ZipEntry> entries = zip.entries();
+      while (entries.hasMoreElements()) {
+        ZipEntry e = entries.nextElement();
+        String name = e.getName();
+        if (name.matches("classes[0-9]*\\.dex")) dex = true;
+        if ((name.startsWith("lib/armeabi-v7a/") || name.startsWith("lib/armeabi/"))
+            && name.endsWith(".so")) {
+          File lib = new File(root, new File(name).getName());
+          if (!lib.exists())
+            try (InputStream in = zip.getInputStream(e);
+                OutputStream out = new FileOutputStream(lib)) {
+              out.write(read(in, 20_000_000));
+            }
+          lib.setReadOnly();
+        }
+      }
+    }
+    if (!dex) throw new IOException("此 JAR 没有 Android DEX 字节码，请使用 Android 版插件");
+    DexClassLoader loader =
+        new DexClassLoader(
+            archive.getAbsolutePath(),
+            root.getAbsolutePath(),
+            root.getAbsolutePath(),
+            context.getClassLoader());
+    try {
+      Class<?> init = loader.loadClass("com.github.catvod.spider.Init");
+      init.getMethod("init", Context.class).invoke(null, context);
+    } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+    }
+    String name = site.optString("api").substring(4);
+    if (!name.contains(".")) name = "com.github.catvod.spider." + name;
+    Object object = loader.loadClass(name).getDeclaredConstructor().newInstance();
+    if (!(object instanceof Spider)) throw new IOException("插件没有实现 CatVod Spider 接口");
+    Spider spider = (Spider) object;
+    spider.siteKey = site.optString("id", site.optString("key"));
+    spider.js.scope(spider.siteKey);
+    if (android.os.Build.VERSION.SDK_INT >= 24)
+      spider.net = new com.github.catvod.net.Net(null, spider.siteKey);
+    spider.local = new com.github.catvod.utils.Local(spider.siteKey);
+    spider.init(context, site.optString("ext"));
+    jarSpiders.put(spider.siteKey, spider);
+    return new Session() {
+      public JSONObject call(JSONObject p) throws Exception {
+        String answer;
+        if (p.has("play"))
+          answer =
+              spider.playerContent(
+                  p.optString("flag"), p.optString("play"), Collections.emptyList());
+        else if (p.has("ids"))
+          answer = spider.detailContent(Arrays.asList(p.optString("ids").split(",")));
+        else if (p.has("wd"))
+          answer = spider.searchContent(p.optString("wd"), false, p.optString("pg", "1"));
+        else if (p.has("t"))
+          answer =
+              spider.categoryContent(
+                  p.optString("t"),
+                  p.optString("pg", "1"),
+                  true,
+                  new HashMap<>(Json.headers(Json.object(p.optString("filters", "{}")))));
+        else {
+          JSONObject home = Json.object(spider.homeContent(true));
+          JSONObject videos = Json.object(spider.homeVideoContent());
+          if (videos.has("list")) home.put("list", videos.opt("list"));
+          return home;
+        }
+        return new JSONObject(answer);
+      }
+
+      public void close() {
+        jarSpiders.remove(spider.siteKey, spider);
+        try {
+          spider.destroy();
+        } finally {
+          spider.closeHostResources();
+        }
+      }
+    };
+  }
+
+  private static byte[] read(InputStream in, int max) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    byte[] buf = new byte[16384];
+    int n;
+    while ((n = in.read(buf)) != -1) {
+      if (out.size() + n > max) throw new IOException("插件资源过大");
+      out.write(buf, 0, n);
+    }
+    return out.toByteArray();
+  }
+
+  public JSONObject playback(JSONObject site, JSONObject video, JSONObject episode)
+      throws Exception {
+    String url = episode.optString("url");
+    JSONObject answer;
+    if (site.length() == 0 || Catalog.direct(url)) answer = Json.obj("url", url, "parse", 0);
+    else answer = call(site, Json.obj("play", url, "flag", episode.optString("flag")));
+    url = answer.optString("url");
+    if (url.isEmpty()) throw new IOException("源没有返回播放地址");
+    if (answer.optInt("parse") == 1) {
+      JSONArray parses = Json.array(site.opt("parses"));
+      boolean resolved = false;
+      for (JSONObject parse : Json.objects(parses)) {
+        if (parse.optInt("type") == 1)
+          try {
+            JSONObject parsed =
+                http.json(parse.optString("url") + java.net.URLEncoder.encode(url, "UTF-8"));
+            if (parsed.has("url")) {
+              answer = parsed;
+              url = parsed.optString("url");
+              resolved = true;
+              break;
+            }
+          } catch (Exception ignored) {
+          }
+      }
+      if (!resolved) throw new IOException("此线路需要网页解析，请尝试其他线路或配置 JSON 解析接口");
+    }
+    String[] address = url.split("\\|", 2);
+    JSONObject headers = answer.optJSONObject("header");
+    if (headers == null) headers = Json.object(answer.optString("header", "{}"));
+    if (answer.has("ua")) headers.put("User-Agent", answer.optString("ua"));
+    if (answer.has("referer")) headers.put("Referer", answer.optString("referer"));
+    if (address.length == 2)
+      for (String pair : address[1].split("&")) {
+        String[] kv = pair.split("=", 2);
+        if (kv.length == 2) headers.put(kv[0], java.net.URLDecoder.decode(kv[1], "UTF-8"));
+      }
+    String id =
+        site.optString("id") + "@" + video.optString("vod_id") + "@" + episode.optString("id");
+    JSONObject play =
+        Json.obj(
+            "id",
+            id,
+            "historyId",
+            site.optString("id") + "@" + video.optString("vod_id"),
+            "name",
+            video.optString("vod_name", episode.optString("name")),
+            "episode",
+            episode.optString("name"),
+            "url",
+            address[0],
+            "header",
+            headers,
+            "poster",
+            video.optString("vod_pic"),
+            "site",
+            site,
+            "video",
+            video,
+            "episodeInfo",
+            episode,
+            "episodes",
+            new JSONArray(Catalog.episodes(video)),
+            "updated",
+            System.currentTimeMillis());
+    if (answer.has("subt")) play.put("subtitles", answer.opt("subt"));
+    return play;
+  }
+
+  public JSONObject resume(JSONObject saved) throws Exception {
+    JSONObject oldSite = Json.child(saved, "site");
+    JSONObject currentSite = YingxiaApp.get().repository.site(oldSite.optString("id"));
+    if (currentSite.length() == 0) currentSite = oldSite;
+    String videoId = Json.child(saved, "video").optString("vod_id");
+    List<JSONObject> videos = Catalog.videos(call(currentSite, Json.obj("ids", videoId)));
+    if (videos.isEmpty()) throw new IOException("来源没有返回此影片，请重新搜索");
+    JSONObject video = videos.get(0), oldEpisode = Json.child(saved, "episodeInfo");
+    for (JSONObject episode : Catalog.episodes(video)) {
+      if (episode.optString("name").equals(oldEpisode.optString("name"))
+          && episode.optString("flag").equals(oldEpisode.optString("flag"))) {
+        JSONObject play = playback(currentSite, video, episode);
+        play.put("position", saved.optBoolean("completed") ? 0 : saved.optLong("position"));
+        return play;
+      }
+    }
+    throw new IOException("来源的集数已变化，请在详情页重新选集");
+  }
+}

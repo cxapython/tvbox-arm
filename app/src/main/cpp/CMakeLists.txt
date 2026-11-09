@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(yingxia_script C)
+set(QJS ${CMAKE_CURRENT_SOURCE_DIR}/../../../../vendor/QuickJS)
+add_library(yingxia-script SHARED script_jni.c ${QJS}/quickjs.c ${QJS}/libregexp.c ${QJS}/libunicode.c ${QJS}/dtoa.c ${QJS}/TVScript.c)
+target_include_directories(yingxia-script PRIVATE ${QJS} ${QJS}/include)
+target_compile_definitions(yingxia-script PRIVATE _GNU_SOURCE QUICKJS_NG_BUILD NDEBUG)
+target_link_libraries(yingxia-script m log)
+target_link_options(yingxia-script PRIVATE "-Wl,-z,max-page-size=16384")

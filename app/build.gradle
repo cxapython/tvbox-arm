@@ -1,0 +1,80 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.yingxia.tv'
+    compileSdk 34
+    useLibrary 'android.test.runner', false
+    useLibrary 'android.test.base', false
+    useLibrary 'android.test.mock', false
+    ndkVersion '28.2.13676358'
+    defaultConfig {
+        applicationId 'com.yingxia.tv'
+        minSdk 21
+        targetSdk 34 // minSdk stays 21 for older Xiaomi TVs.
+        versionCode 1
+        versionName '1.8.15-android.1'
+        ndk { abiFilters 'armeabi-v7a' }
+        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_static'; cFlags '-O2' } }
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+        buildConfigField 'String', 'SOURCE_REVISION', '"030330f67eda8edf8f29e6611c1cb9ed03734f85"'
+    }
+    // Emulator validation uses an additional ABI; release always contains ARM32 only.
+    if (project.hasProperty('emulator')) { defaultConfig.ndk.abiFilters.add('arm64-v8a') }
+    externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+    buildFeatures { buildConfig true }
+    buildTypes {
+        release { minifyEnabled false }
+    }
+    packaging { jniLibs { useLegacyPackaging true }; resources { excludes += ['META-INF/DEPENDENCIES', 'META-INF/INDEX.LIST'] } }
+    lint { abortOnError true; disable 'ObsoleteSdkInt', 'OldTargetApi', 'ExpiredTargetSdkVersion' }
+}
+
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs_nio:2.1.2'
+    implementation 'androidx.annotation:annotation:1.8.2'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'androidx.media3:media3-exoplayer:1.4.1'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.4.1'
+    implementation 'androidx.media3:media3-exoplayer-dash:1.4.1'
+    implementation 'androidx.media3:media3-ui:1.4.1'
+    implementation 'androidx.media3:media3-database:1.4.1'
+    implementation 'org.jsoup:jsoup:1.18.1'
+    implementation 'com.google.code.gson:gson:2.11.0'
+    implementation 'com.google.zxing:core:3.5.3'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}
+
+// A real DEX plugin verifies the class-loader/host ABI without bundling a production source.
+def fixtureClasses = layout.buildDirectory.dir('intermediates/spiderFixture/classes')
+def fixtureAssets = layout.buildDirectory.dir('generated/spiderFixture/assets')
+android.sourceSets.androidTest.assets.srcDir(fixtureAssets)
+def fixtureCompile = tasks.register('compileSpiderFixture', JavaCompile) {
+    dependsOn 'compileDebugJavaWithJavac'
+    source fileTree('src/androidTest/fixture') { include '**/*.java' }
+    classpath = files(android.bootClasspath) + tasks.named('compileDebugJavaWithJavac').get().classpath + files(tasks.named('compileDebugJavaWithJavac').get().destinationDirectory)
+    destinationDirectory = fixtureClasses
+    sourceCompatibility = '1.8'
+    targetCompatibility = '1.8'
+}
+def fixtureDex = tasks.register('dexSpiderFixture', Exec) {
+    dependsOn fixtureCompile
+    inputs.dir fixtureClasses
+    outputs.file fixtureAssets.map { it.file('spider-fixture.jar') }
+    doFirst {
+        fixtureAssets.get().asFile.mkdirs()
+        commandLine([new File(android.sdkDirectory, 'build-tools/34.0.0/d8').absolutePath,
+                     '--min-api', '21', '--lib', android.bootClasspath[0].absolutePath,
+                     '--classpath', tasks.named('compileDebugJavaWithJavac').get().destinationDirectory.get().asFile.absolutePath,
+                     '--output', fixtureAssets.get().file('spider-fixture.jar').asFile.absolutePath] +
+                    fileTree(fixtureClasses).matching { include '**/*.class' }.files.collect { it.absolutePath })
+    }
+}
+tasks.configureEach {
+    if (name == 'mergeDebugAndroidTestAssets' || name == 'generateDebugAndroidTestLintModel' || name == 'lintAnalyzeDebugAndroidTest') dependsOn fixtureDex
+}
