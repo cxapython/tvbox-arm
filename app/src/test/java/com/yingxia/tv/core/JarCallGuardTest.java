@@ -113,6 +113,10 @@ public class JarCallGuardTest {
     } catch (SocketTimeoutException expected) {
       assertTrue(expected.getMessage().contains("1 秒"));
     }
+    // Cancellation interrupts the worker; admission is released by its finally block.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (guard.isBusy() && System.nanoTime() < deadline) Thread.sleep(10);
+    assertFalse("Interrupted worker did not release admission", guard.isBusy());
     try {
       guard.call(
           5,

@@ -17,6 +17,17 @@ public final class MusicClient {
 
   public final GdMusicCatalog gd = new GdMusicCatalog(this::musicJson);
   public final NativeMusicCatalog nativeCatalog = new NativeMusicCatalog(this::catalogJson);
+  public final MusifyCatalog musify = new MusifyCatalog(this::musifyText);
+
+  private String musifyText(String url) throws Exception {
+    Http.Result response = http.request(url, "GET",
+        Http.params("User-Agent", MusifyCatalog.USER_AGENT, "Referer", MusifyCatalog.BASE + "/",
+            "X-Requested-With", "fetch", "Cache-Control", "no-cache"),
+        null, 3_000_000, true, 15000);
+    if (response.status < 200 || response.status >= 300)
+      throw new IOException(MusifyCatalog.errorMessage(response.status, response.text()));
+    return response.text();
+  }
 
   private JSONObject catalogJson(String url, String method, Map<String, String> query,
       Map<String, String> extraHeaders, JSONObject body) throws Exception {
@@ -38,6 +49,7 @@ public final class MusicClient {
       case "kuwo": return "酷我音乐";
       case "migu": return "咪咕音乐";
       case "kugou": return "酷狗音乐";
+      case "musify": return "Musify";
       default: return "音乐";
     }
   }
@@ -78,6 +90,7 @@ public final class MusicClient {
   }
 
   public List<JSONObject> search(String query, String source, int page) throws Exception {
+    if (source.equals("musify")) return Json.objects(musify.searchPage(query, page).getJSONArray("items"));
     if (source.equals("netease")) return gd.search(query, page);
     if (Arrays.asList("tencent", "qq", "migu", "kuwo").contains(source)) return nativeCatalog.search(source, query, page);
     String url =
@@ -125,6 +138,7 @@ public final class MusicClient {
 
   public JSONObject play(JSONObject song, String quality) throws Exception {
     String normalized = MusicResolver.normalizeQuality(quality);
+    if (song.optString("source").equals("musify")) return playDirect(song, normalized);
     try {
       return playDirect(song, normalized);
     } catch (Exception first) {
@@ -167,6 +181,7 @@ public final class MusicClient {
 
   public JSONObject lyricData(JSONObject song) throws Exception {
     String source = song.optString("source");
+    if (source.equals("musify")) return Json.obj("lyric", "", "translation", "");
     String catalog = song.optString("catalogSource");
     if (catalog.equals("tencent") || catalog.equals("qq")) return nativeCatalog.lyrics(song.optString("catalogSongId"));
     if (catalog.equals("netease")) return gd.lyric(song.optString("catalogSongId"));
@@ -209,6 +224,7 @@ public final class MusicClient {
   }
 
   private List<MusicResolver.Provider> providers(String platform) {
+    if (platform.equals("musify")) return Collections.singletonList(provider("Musify", musify::resolve));
     List<MusicResolver.Provider> out = new ArrayList<>();
     switch (sourceKey(platform)) {
       case "mg":

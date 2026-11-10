@@ -2,6 +2,10 @@
 
 移植基线：`tvbox-silicon` / `030330f67eda8edf8f29e6611c1cb9ed03734f85`，GPL-3.0-only。Swift 业务逻辑转为 Java；Android TV 使用 Media3 解码和原生遥控器控件。
 
+原版 tvOS 使用 `AVPlayerViewController` 的系统播放控件，叠加 SwiftUI 封面和歌词；Android 的 `MusicPlayerActivity` 是独立原生界面的重写，不是直接复用 AVKit，也不代表界面已经完全一致。音乐首页／搜索列表负责选歌，点击歌曲后才进入播放器。
+
+音乐播放器提供可见的「‹ 返回」按钮，关闭后保留原搜索结果；搜索页的「返回」恢复上一页，音乐首页的「返回」进入应用首页。遥控器返回键继续可用。空专辑名时播放器顶部显示「正在播放 · 平台」，歌曲文字宽度独立于封面宽度。
+
 ## 原项目对应关系
 
 | 原项目 | Android |
@@ -16,7 +20,9 @@
 | MusicResolution 的 companion catalogs | 原通道失败后匹配其他平台的同一录音；保留收藏身份、保存实际播放平台与 ID，标明“已切换音源” |
 | MusicHealth.admit | `MusicRequestBudget.java`：GD 50 次／5 分钟、星海 30 次／5 分钟，跨请求与客户端实例共享并保存；VKeys 风控冷却 10 分钟 |
 
-所有点播音乐入口，包括收藏、历史和离线下载，统一进入独立 `MusicPlayerActivity`。影视继续使用 `PlayerActivity`。歌单内点歌携带整份队列，换页不会截断队列；单首搜索结果按单曲播放。离开播放器暂停，退出释放解码器。
+所有点播音乐入口，包括收藏、历史和离线下载，统一进入独立 `MusicPlayerActivity`。影视继续使用 `PlayerActivity`。歌单内点歌携带整份队列，换页不会截断队列；单首搜索结果按单曲播放。歌曲长按菜单支持收藏和下载。离开播放器暂停，退出释放解码器。
+
+Android 端另行接入 Musify 公开歌曲搜索、歌手链接浏览、原始音质播放及离线缓存，不属于上述 Swift 移植基线。详见 [Musify 适配记录](MUSIFY.md)。
 
 原版只为 QQ 和网易云提供上述推荐与歌单接口；酷我、咪咕此次按原版接入歌曲搜索与播放，不添加没有实现的歌单入口。原有酷狗 GD 接口保留。需要用户提供密钥的可选 HYW 音源没有自动启用。
 

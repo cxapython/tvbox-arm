@@ -123,14 +123,15 @@ public final class MusicPlayerActivity extends Activity {
     pad(content, height < 450 ? 28 : 48, height < 450 ? 10 : 24);
     root.addView(content, new FrameLayout.LayoutParams(-1, -1));
     LinearLayout header = horizontal(this);
-    TextView back = control("‹", "返回音乐", this::finish);
-    header.addView(back, new LinearLayout.LayoutParams(dp(this, 44), dp(this, 36)));
+    TextView back = control("‹ 返回", "返回歌曲列表", this::finish);
+    back.setTag("music-back");
+    header.addView(back, new LinearLayout.LayoutParams(dp(this, 92), dp(this, 44)));
     album = text(this, "", 15, 0xccffffff);
     album.setSingleLine(true);
     album.setGravity(Gravity.CENTER);
     header.addView(album, new LinearLayout.LayoutParams(0, -2, 1));
-    TextView more = control("•••", "更多音乐操作", this::more);
-    header.addView(more, new LinearLayout.LayoutParams(dp(this, 44), dp(this, 36)));
+    TextView more = control("更多", "更多音乐操作", this::more);
+    header.addView(more, new LinearLayout.LayoutParams(dp(this, 92), dp(this, 44)));
     content.addView(header);
     stage = horizontal(this);
     stage.setGravity(Gravity.CENTER);
@@ -146,15 +147,17 @@ public final class MusicPlayerActivity extends Activity {
     cover.setClipToOutline(true);
     cover.setElevation(dp(this, 12));
     cover.setContentDescription("专辑封面");
-    artSize = Math.min(320, Math.max(110, height - 210));
+    artSize = Math.min(320, Math.max(110, height - 218));
     songColumn.addView(cover, new LinearLayout.LayoutParams(dp(this, artSize), dp(this, artSize)));
     gap(songColumn, 12);
     title = text(this, "", height < 450 ? 20 : 27, Color.WHITE);
     title.setTypeface(null, Typeface.BOLD);
     title.setSingleLine(true);
+    title.setEllipsize(android.text.TextUtils.TruncateAt.END);
     title.setTag("music-song-title");
     artist = text(this, "", height < 450 ? 14 : 19, 0xaaffffff);
     artist.setSingleLine(true);
+    artist.setEllipsize(android.text.TextUtils.TruncateAt.END);
     songColumn.addView(title, new LinearLayout.LayoutParams(dp(this, artSize), -2));
     songColumn.addView(artist, new LinearLayout.LayoutParams(dp(this, artSize), -2));
     lyricColumn = vertical(this);
@@ -266,7 +269,7 @@ public final class MusicPlayerActivity extends Activity {
         if (state == Player.STATE_ENDED && !busy && index + 1 < queue.size()) select(index + 1, 0, currentQuality());
       }
       @Override public void onPlayerError(PlaybackException error) {
-        failure = "播放失败，请重试或切换音质";
+        failure = play.optBoolean("fixedQuality") ? "播放失败，请稍后重试" : "播放失败，请重试或切换音质";
         retryIndex = index; retryPosition = player.getCurrentPosition(); retryQuality = currentQuality();
         if (!recovered && !play.optBoolean("complete") && error.errorCode >= PlaybackException.ERROR_CODE_IO_UNSPECIFIED
             && error.errorCode < PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED) {
@@ -294,7 +297,8 @@ public final class MusicPlayerActivity extends Activity {
     final JSONObject song = Json.copy(play);
     title.setText(song.optString("name"));
     artist.setText(song.optString("artist"));
-    album.setText(queueTitle.isEmpty() ? song.optString("album", "音乐") : queueTitle);
+    String collection = queueTitle.isEmpty() ? song.optString("album") : queueTitle;
+    album.setText(collection.isEmpty() ? "正在播放 · " + MusicClient.platformName(song.optString("source")) : collection);
     lyrics = null;
     lyricIndex = Integer.MIN_VALUE;
     cover.setImageDrawable(monogram(this, song.optString("name", "♫")));
@@ -354,6 +358,10 @@ public final class MusicPlayerActivity extends Activity {
     boolean visible = showsLyrics && lyrics != null && !lyrics.lines.isEmpty();
     lyricColumn.setVisibility(visible ? View.VISIBLE : View.GONE);
     songColumn.setLayoutParams(new LinearLayout.LayoutParams(0, -1, visible ? 0.44f : 1));
+    int available = (int) (getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density) - 96;
+    int textWidth = Math.min(artSize + 200, (int) (available * (visible ? 0.44f : 1)));
+    title.setLayoutParams(new LinearLayout.LayoutParams(dp(this, textWidth), -2));
+    artist.setLayoutParams(new LinearLayout.LayoutParams(dp(this, textWidth), -2));
     title.setGravity(visible ? Gravity.START : Gravity.CENTER);
     artist.setGravity(visible ? Gravity.START : Gravity.CENTER);
     lyricToggle.setText(showsLyrics ? "歌词 ✓" : "歌词");
@@ -437,7 +445,7 @@ public final class MusicPlayerActivity extends Activity {
         runOnUiThread(() -> {
           if (destroyed || token != generation) return;
           busy = false;
-          failure = "音源暂时不可用，按重试或切换音质";
+          failure = play.optBoolean("fixedQuality") ? "音源暂时不可用，请稍后重试" : "音源暂时不可用，按重试或切换音质";
           updateControls();
         });
       }
@@ -446,6 +454,7 @@ public final class MusicPlayerActivity extends Activity {
 
   private void chooseQuality() {
     if (busy) return;
+    if (play.optBoolean("fixedQuality")) { Toast.makeText(this, "使用站点提供的原始音质，实际音质见播放状态", Toast.LENGTH_SHORT).show(); return; }
     if (play.optBoolean("complete")) { Toast.makeText(this, "正在播放已下载音质", Toast.LENGTH_SHORT).show(); return; }
     new AlertDialog.Builder(this).setTitle("音乐音质")
         .setSingleChoiceItems(new String[] {"FLAC 无损", "320 kbps", "128 kbps"},
@@ -485,7 +494,7 @@ public final class MusicPlayerActivity extends Activity {
     pause.setText(!failure.isEmpty() ? "重试" : wantsPlayback ? "Ⅱ" : "▶");
     pause.setContentDescription(!failure.isEmpty() ? "重试" : wantsPlayback ? "暂停" : "播放");
     String tier = currentQuality();
-    quality.setText(tier.equals(MusicResolver.FLAC) ? "优先无损" : "优先 " + tier + "k");
+    quality.setText(play.optBoolean("fixedQuality") ? "原始音质" : tier.equals(MusicResolver.FLAC) ? "优先无损" : "优先 " + tier + "k");
     queueButton.setText("待播 " + (index + 1) + "/" + queue.size());
     favorite.setText(app().repository.contains("favorites", play.optString("id")) ? "♥" : "♡");
     String source;
@@ -499,7 +508,7 @@ public final class MusicPlayerActivity extends Activity {
     }
     if (play.optBoolean("sourceFallback")) source += " · 已切换音源";
     Format format = player.getAudioFormat();
-    String actual = MusicAudioQuality.describe(tier, format == null ? null : format.sampleMimeType,
+    String actual = MusicAudioQuality.describe(play.optBoolean("fixedQuality") ? "original" : tier, format == null ? null : format.sampleMimeType,
         format == null ? -1 : format.averageBitrate, format == null ? -1 : format.sampleRate);
     status.setText(!failure.isEmpty() ? failure : busy ? "正在准备音源…" : player.getPlaybackState() == Player.STATE_BUFFERING
         ? "正在缓冲…" : source + (actual.isEmpty() ? "" : "   ·   " + actual));

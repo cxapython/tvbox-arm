@@ -253,10 +253,23 @@ public final class MainActivity extends Activity {
     heading = text(this, title, 30, TEXT);
     heading.setTypeface(null, Typeface.BOLD);
     header = horizontal(this);
+    if (section != 0 || !back.isEmpty()) {
+      TextView up = button(this, "‹ 返回", this::navigateUp);
+      up.setTag("page-back");
+      up.setContentDescription("返回上一页");
+      spaced(header, up, 12);
+    }
     header.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
     body.addView(header);
     gap(body, 22);
     return generation;
+  }
+
+  /** On-screen navigation leaves the page directly; remote Back may first focus the sidebar. */
+  private void navigateUp() {
+    NavigationSnapshot previous = back.pop();
+    if (previous != null) restore(previous);
+    else select(0);
   }
 
   private void loaded(Object data) {
@@ -1672,14 +1685,25 @@ public final class MainActivity extends Activity {
     LinearLayout platforms = actions();
     String[][] options = {
       {"netease", "GD 音乐台 · 网易云"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"},
-      {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}
+      {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}, {"musify", "Musify"}
     };
-    for (String[] p : options)
-      spaced(platforms, button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1)), 10);
+    for (String[] p : options) {
+      TextView platform = button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1));
+      spaced(platforms, platform, 10);
+      if (p[0].equals(provider)) platform.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+        @Override public void onGlobalLayout() {
+          platform.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+          if (token == generation) {
+            HorizontalScrollView rail = (HorizontalScrollView) platforms.getParent();
+            rail.scrollTo(Math.max(0, platform.getRight() - rail.getWidth() + dp(MainActivity.this, 2)), 0);
+          }
+        }
+      });
+    }
     LinearLayout controls = actions();
     String quality = MusicResolver.normalizeQuality(repo.settings.getString("musicQuality", MusicResolver.HIGH));
     String qualityLabel = quality.equals(MusicResolver.FLAC) ? "FLAC 无损" : quality + " kbps";
-    spaced(controls, button(this, "优先音质：" + qualityLabel, () -> new AlertDialog.Builder(this)
+    if (!provider.equals("musify")) spaced(controls, button(this, "优先音质：" + qualityLabel, () -> new AlertDialog.Builder(this)
         .setTitle("音乐音质")
         .setItems(new String[] {"FLAC 无损", "320 kbps", "128 kbps"}, (dialog, selected) -> {
           repo.settings.edit().putString("musicQuality", selected == 0 ? MusicResolver.FLAC : selected == 1 ? MusicResolver.HIGH : MusicResolver.STANDARD).apply();
@@ -1694,12 +1718,18 @@ public final class MainActivity extends Activity {
       body.addView(text(this, provider.equals("netease") ? "音源：GD 音乐台 · music.gdstudio.xyz · 仅限个人非商业使用" : "QQ 音乐 · 榜单、歌单和专辑", 12, SECONDARY));
       gap(body, 12);
     }
+    if (provider.equals("musify")) {
+      body.addView(text(this, "Musify · 站点原始音质 · 点按播放，长按收藏或下载", 12, SECONDARY));
+      gap(body, 12);
+    }
     LinearLayout row = horizontal(this);
-    EditText input = edit("搜索歌曲、歌手、歌单或专辑", query);
+    EditText input = edit(provider.equals("musify") ? "搜索歌曲、歌手，或粘贴 Musify 歌手链接" : "搜索歌曲、歌手、歌单或专辑", query);
     row.addView(input, new LinearLayout.LayoutParams(0, dp(this, 52), 1));
     Runnable search = () -> {
       hideKeyboard(input);
-      music(provider, input.getText().toString().trim(), 1, kind, null);
+      String nextQuery = input.getText().toString().trim();
+      if (nextQuery.equals(query)) music(provider, nextQuery, 1, kind, null);
+      else push(() -> music(provider, nextQuery, 1, kind, null));
     };
     input.setOnEditorActionListener((v, action, event) -> {
       if (action != EditorInfo.IME_ACTION_SEARCH) return false;
@@ -1736,7 +1766,7 @@ public final class MainActivity extends Activity {
         if (items.isEmpty()) body.addView(text(this, "没有更多结果，试试其他关键词。", 16, SECONDARY));
         if (kind.equals("song") || !MusicClient.hasCollections(provider)) musicSongs(items);
         else musicCollections(items);
-        pagination(pg, items.size() == GdMusicCatalog.PAGE_SIZE ? pg + 1 : pg,
+        pagination(pg, result.optBoolean("hasNext", items.size() == GdMusicCatalog.PAGE_SIZE) ? pg + 1 : pg,
             next -> music(provider, query, next, kind, null));
       }
     };
@@ -1745,6 +1775,7 @@ public final class MainActivity extends Activity {
     async(token, () -> {
       MusicClient client = new MusicClient();
       if (query.isEmpty()) return Json.obj("sections", new JSONArray(client.browse(provider)));
+      if (provider.equals("musify")) return client.musify.searchPage(query, pg);
       List<JSONObject> items = MusicClient.hasCollections(provider) && !kind.equals("song")
           ? client.collections(query, provider, kind, pg) : client.search(query, provider, pg);
       return Json.obj("items", new JSONArray(items));
@@ -1764,7 +1795,7 @@ public final class MainActivity extends Activity {
   private void musicCollection(JSONObject collection, int pg, List<JSONObject> cached) {
     int token = page("musicCollection", collection.optString("name"), Json.obj("collection", collection, "page", pg),
         () -> musicCollection(collection, pg, null));
-    body.addView(text(this, MusicClient.platformName(collection.optString("source", "netease")) + " · 长按歌曲收藏", 14, SECONDARY));
+    body.addView(text(this, MusicClient.platformName(collection.optString("source", "netease")) + " · 长按歌曲收藏或下载", 14, SECONDARY));
     Consumer<List<JSONObject>> render = songs -> {
       loaded();
       loaded(songs);
@@ -1789,7 +1820,7 @@ public final class MainActivity extends Activity {
 
   private void musicSongs(List<JSONObject> songs, List<JSONObject> queue, String source) {
     tiles(songs, song -> song.optString("name"),
-        song -> song.optString("artist") + " · " + song.optString("album") +
+        song -> song.optString("artist") + (song.optString("album").isEmpty() ? "" : " · " + song.optString("album")) +
             (song.optLong("duration") > 0 ? " · " + formatTime(song.optLong("duration")) : ""),
         song -> {
           toast("正在准备音源…");
@@ -1798,7 +1829,16 @@ public final class MainActivity extends Activity {
                 if (queue == null) MusicPlayerActivity.open(this, play);
                 else MusicPlayerActivity.open(this, play, queue, queue.indexOf(song), source);
               });
-        }, song -> toast(repo.favorite(song) ? "已收藏歌曲" : "已取消收藏"));
+        }, song -> new AlertDialog.Builder(this).setTitle(song.optString("name"))
+            .setItems(new String[] {repo.contains("favorites", song.optString("id")) ? "取消收藏" : "收藏歌曲", "下载歌曲"},
+                (dialog, selected) -> {
+                  if (selected == 0) toast(repo.favorite(song) ? "已收藏歌曲" : "已取消收藏");
+                  else {
+                    toast("正在准备下载…");
+                    async(generation, () -> new MusicClient().play(song, repo.settings.getString("musicQuality", MusicResolver.HIGH)),
+                        play -> OfflineService.add(this, play));
+                  }
+                }).setNegativeButton("返回", null).show());
   }
 
   private void downloads() {

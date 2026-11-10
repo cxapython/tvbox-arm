@@ -25,7 +25,7 @@ public final class MusicAudioQuality {
     else if (!lossless) label += " · 码率待确认";
     if (sampleRate > 0) label += " · " + String.format(Locale.ROOT, "%.1f kHz", sampleRate / 1000f);
     String tier = MusicResolver.normalizeQuality(requested);
-    if (!lossless && (tier.equals(MusicResolver.FLAC) || tier.equals(MusicResolver.HIGH) && bitrate > 0 && bitrate < 288000))
+    if (!"original".equals(requested) && !lossless && (tier.equals(MusicResolver.FLAC) || tier.equals(MusicResolver.HIGH) && bitrate > 0 && bitrate < 288000))
       label += " · 已降级";
     return label;
   }
