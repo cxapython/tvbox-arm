@@ -10,6 +10,7 @@ import java.net.*;
 import java.nio.charset.*;
 import java.security.*;
 import java.util.*;
+import java.util.concurrent.atomic.*;
 import okhttp3.*;
 import org.json.*;
 
@@ -28,8 +29,7 @@ public final class ScriptRuntime implements AutoCloseable {
   private long handle;
   private final String origin;
   private String entryModule = "";
-  private final Map<String, String> pending = new HashMap<>();
-  private int nextRequest = 1;
+  private final ScriptHttpTasks httpTasks = new ScriptHttpTasks(ScriptHttpTasks.defaultExecutor());
 
   private native long create();
 
@@ -68,17 +68,26 @@ public final class ScriptRuntime implements AutoCloseable {
     if (error != null) throw new IOException(new String(error, StandardCharsets.UTF_8));
   }
 
-  public synchronized Object call(String expression) throws Exception {
+  public Object call(String expression) throws Exception {
+    return call(expression, 40);
+  }
+
+  public synchronized Object call(String expression, int seconds) throws Exception {
     ensureOpen();
-    byte[] result = evaluate(handle, utf8(expression), 40);
+    if (seconds < 1) throw new IllegalArgumentException("脚本超时时间必须大于零");
+    byte[] result = evaluate(handle, utf8(expression), seconds);
     if (result == null) throw new IOException("脚本没有返回结果");
     JSONObject envelope = new JSONObject(new String(result, StandardCharsets.UTF_8));
     if (envelope.has("error")) throw new IOException(envelope.optString("error"));
     return envelope.opt("value");
   }
 
-  public synchronized JSONObject object(String expression) throws Exception {
-    Object value = call(expression);
+  public JSONObject object(String expression) throws Exception {
+    return object(expression, 40);
+  }
+
+  public synchronized JSONObject object(String expression, int seconds) throws Exception {
+    Object value = call(expression, seconds);
     JSONObject o =
         value instanceof JSONObject
             ? (JSONObject) value
@@ -112,6 +121,7 @@ public final class ScriptRuntime implements AutoCloseable {
       dispose(handle);
       handle = 0;
     }
+    httpTasks.cancelAll();
     supplied.clear();
   }
 
@@ -203,27 +213,32 @@ public final class ScriptRuntime implements AutoCloseable {
         return network(new JSONObject(arg)).toString();
       case "httpStart":
         {
-          String id = "" + (nextRequest++);
-          pending.put(id, network(new JSONObject(arg)).toString());
-          return id;
+          // Real background execution: the handle returns at once and the answer is polled later.
+          JSONObject req = new JSONObject(arg);
+          return httpTasks.start(cancel -> network(req, cancel).toString());
         }
       case "httpPoll":
-        return pending.remove(arg);
+        return httpTasks.poll(arg);
       case "httpCancel":
-        pending.remove(arg);
+        httpTasks.cancel(arg);
         return null;
       default:
-        if (op.startsWith("manga.")) return manga(op.substring(6), arg);
         throw new IllegalArgumentException("不支持的脚本操作: " + op);
     }
   }
 
   private JSONObject network(JSONObject o) throws Exception {
+    return network(o, null);
+  }
+
+  /** {@code cancel}, when non-null, gets a hook interrupting the in-flight okhttp call. */
+  private JSONObject network(JSONObject o, ScriptHttpTasks.CancelHandle cancel) throws Exception {
     String url = o.optString("url");
     if (!url.startsWith("http://") && !url.startsWith("https://"))
       url = ConfigCodec.address(url, origin);
     byte[] body = o.isNull("body") ? null : utf8(o.optString("body"));
     if (!o.isNull("bodyBase64")) body = Base64.getDecoder().decode(o.optString("bodyBase64"));
+    CancellableCall inFlight = cancellableCall(cancel);
     Http.Result result =
         http.request(
             url,
@@ -232,7 +247,9 @@ public final class ScriptRuntime implements AutoCloseable {
             body,
             20_000_000,
             o.optBoolean("redirect", true),
-            o.optInt("timeout", 20000));
+            o.optInt("timeout", 20000),
+            inFlight.reference,
+            inFlight.cancelled::get);
     JSONObject out =
         Json.obj(
             "code",
@@ -248,6 +265,27 @@ public final class ScriptRuntime implements AutoCloseable {
       out.put(
           "content", new String(result.bytes, Charset.forName(o.optString("encoding", "utf-8"))));
     return out;
+  }
+
+  /**
+   * Publishes okhttp calls without a cancellation race: cancelling before {@code set} still cancels
+   * the call as soon as the transport creates it, and cancelling after {@code set} cancels it now.
+   */
+  private static final class CancellableCall {
+    final AtomicBoolean cancelled = new AtomicBoolean();
+    final AtomicReference<Call> reference = new AtomicReference<>();
+  }
+
+  private static CancellableCall cancellableCall(ScriptHttpTasks.CancelHandle cancel) {
+    CancellableCall inFlight = new CancellableCall();
+    if (cancel != null)
+      cancel.attach(
+          () -> {
+            inFlight.cancelled.set(true);
+            Call call = inFlight.reference.get();
+            if (call != null) call.cancel();
+          });
+    return inFlight;
   }
 
   private JSONObject url(JSONObject o) throws Exception {
@@ -282,129 +320,4 @@ public final class ScriptRuntime implements AutoCloseable {
         "");
   }
 
-  private String manga(String op, String arg) throws Exception {
-    JSONObject o = arg.equals("null") ? new JSONObject() : Json.object(arg);
-    String key;
-    switch (op) {
-      case "httpStart":
-        {
-          JSONObject req = new JSONObject(arg);
-          Http.Result r =
-              http.request(
-                  req.optString("url"),
-                  req.optString("method", "GET"),
-                  Json.headers(req.optJSONObject("headers")),
-                  req.isNull("body") ? null : Base64.getDecoder().decode(req.optString("body")),
-                  20_000_000,
-                  true,
-                  30000);
-          String id = "" + (nextRequest++);
-          pending.put(
-              id,
-              Json.obj(
-                      "status",
-                      r.status,
-                      "headers",
-                      new JSONObject(r.headers),
-                      "base64",
-                      Base64.getEncoder().encodeToString(r.bytes),
-                      "text",
-                      r.text())
-                  .toString());
-          return id;
-        }
-      case "httpPoll":
-        return pending.remove(arg);
-      case "locale":
-        return JSONObject.quote("zh_CN");
-      case "platform":
-        return JSONObject.quote("android");
-      case "uuid":
-        return JSONObject.quote(UUID.randomUUID().toString());
-      case "notice":
-        return "null";
-      case "encode":
-        return JSONObject.quote(
-            Base64.getEncoder()
-                .encodeToString(
-                    o.optString("text").getBytes(Charset.forName(o.optString("encoding", "gbk")))));
-      case "data":
-        key = "venera." + o.optString("key") + "@";
-        if (o.has("get")) {
-          String v = preferences.getString(key + o.optString("get"), "null");
-          return v;
-        }
-        if (o.has("set"))
-          preferences
-              .edit()
-              .putString(
-                  key + o.optString("set"),
-                  new JSONArray()
-                      .put(o.opt("value"))
-                      .toString()
-                      .replaceFirst("^\\[", "")
-                      .replaceFirst("\\]$", ""))
-              .apply();
-        if (o.has("delete")) preferences.edit().remove(key + o.optString("delete")).apply();
-        return "null";
-      case "cookie":
-        HttpUrl cookieUrl = HttpUrl.get(o.optString("url"));
-        if (o.optString("function").equals("get")) {
-          JSONArray cookies = new JSONArray();
-          for (Cookie c : http.client.cookieJar().loadForRequest(cookieUrl))
-            cookies.put(
-                Json.obj(
-                    "name",
-                    c.name(),
-                    "value",
-                    c.value(),
-                    "domain",
-                    c.domain(),
-                    "path",
-                    c.path(),
-                    "secure",
-                    c.secure(),
-                    "httpOnly",
-                    c.httpOnly()));
-          return cookies.toString();
-        }
-        List<Cookie> cookies = new ArrayList<>();
-        for (JSONObject raw : Json.objects(Json.array(o.opt("cookies")))) {
-          Cookie c =
-              Cookie.parse(
-                  cookieUrl,
-                  raw.optString("name")
-                      + "="
-                      + raw.optString("value")
-                      + "; Path="
-                      + raw.optString("path", "/"));
-          if (c != null) cookies.add(c);
-        }
-        http.client.cookieJar().saveFromResponse(cookieUrl, cookies);
-        return "null";
-      case "cipher":
-        return JSONObject.quote(
-            Json.object(
-                    Crypto.run(
-                        Json.obj(
-                                "op",
-                                "aes",
-                                "mode",
-                                o.optString("mode"),
-                                "encrypt",
-                                o.optBoolean("encrypt"),
-                                "padding",
-                                false,
-                                "key",
-                                o.optString("key"),
-                                "iv",
-                                o.optString("iv"),
-                                "data",
-                                o.optString("data"))
-                            .toString()))
-                .optString("data"));
-      default:
-        throw new IllegalArgumentException("尚未支持漫画操作: " + op);
-    }
-  }
 }

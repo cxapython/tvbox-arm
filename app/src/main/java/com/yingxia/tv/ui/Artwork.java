@@ -29,9 +29,8 @@ public final class Artwork {
   private static final Handler ui = new Handler(Looper.getMainLooper());
 
   public static void load(ImageView view, String address, int width, int height) {
-    String[] parts = address.split("@(?=\\{)", 2);
-    String url = parts[0];
-    String key = url + "@" + width;
+    // The same anti-leech URL can legitimately change cookies/Referer between source sessions.
+    String key = address + "@" + width;
     view.setTag(key);
     Bitmap hit = cache.get(key);
     if (hit != null) {
@@ -42,14 +41,12 @@ public final class Artwork {
     pool.execute(
         () -> {
           try {
+            ArtworkRequest request = ArtworkRequest.parse(address, null);
             byte[] bytes =
                 YingxiaApp.get()
                     .http
                     .get(
-                        url,
-                        parts.length > 1
-                            ? Json.headers(Json.object(parts[1]))
-                            : java.util.Collections.emptyMap())
+                        request.url, request.headers)
                     .bytes;
             Bitmap b = decode(bytes, w, h);
             if (b == null) return;
@@ -58,7 +55,13 @@ public final class Artwork {
                 () -> {
                   if (key.equals(view.getTag())) view.setImageBitmap(b);
                 });
-          } catch (Exception ignored) {
+          } catch (Exception error) {
+            android.util.Log.w("Yingxia.Artwork", "Cannot load artwork", error);
+            ui.post(
+                () -> {
+                  if (key.equals(view.getTag()))
+                    view.setImageResource(android.R.drawable.ic_menu_report_image);
+                });
           }
         });
   }

@@ -24,7 +24,7 @@
             </intent-filter>
         </activity>
         <activity android:name=".ui.PlayerActivity" android:screenOrientation="landscape" android:exported="false" android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
-        <activity android:name=".ui.ReaderActivity" android:screenOrientation="landscape" android:exported="false" />
+        <activity android:name=".ui.RadioActivity" android:screenOrientation="landscape" android:exported="false" />
         <service android:name=".data.OfflineService" android:foregroundServiceType="dataSync" android:exported="false" />
     </application>
 </manifest>

@@ -37,18 +37,17 @@ public final class MainActivity extends Activity {
   private ScrollView scroll;
   private TextView heading;
   private int generation = 0, section = 0;
-  private final Deque<Runnable> back = new ArrayDeque<>();
-  private Runnable route;
+  private final NavigationHistory back = new NavigationHistory();
+  private NavigationSnapshot currentPage;
+  private Runnable route, catalogMore;
+  private boolean catalogLoading, restoringSnapshot;
+  private TextView catalogFooter;
   private final List<TextView> nav = new ArrayList<>();
   private boolean expanded = false;
   private HandoffServer handoff;
   private static final String[] TITLES = {
-    "立即观看", "发现", "直播", "音乐", "漫画", "全局搜索", "来源", "云端文件", "播放历史", "收藏", "下载", "设置"
+    "现在观看", "发现", "直播", "音乐", "全局搜索", "点播源", "播放历史", "收藏", "下载", "设置"
   };
-  private static final String[] ICONS = {
-    "▶", "◈", "◉", "♫", "▤", "⌕", "▦", "▱", "◷", "♡", "↓", "☷"
-  };
-
   @Override
   public void onCreate(Bundle state) {
     super.onCreate(state);
@@ -108,6 +107,9 @@ public final class MainActivity extends Activity {
     scroll.setClipToPadding(false);
     scroll.setVerticalScrollBarEnabled(false);
     scroll.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+    scroll
+        .getViewTreeObserver()
+        .addOnScrollChangedListener(this::maybeLoadMore);
     content.addView(scroll);
     body = vertical(this);
     body.setClipChildren(false);
@@ -203,7 +205,7 @@ public final class MainActivity extends Activity {
         home();
         break;
       case 1:
-        discover("featured", 1);
+        discover(DiscoverCatalog.DEFAULT_FEED, 1);
         break;
       case 2:
         live();
@@ -212,24 +214,18 @@ public final class MainActivity extends Activity {
         music("netease", "", 1);
         break;
       case 4:
-        manga();
-        break;
-      case 5:
         searchPage("");
         break;
-      case 6:
+      case 5:
         sources();
         break;
-      case 7:
-        cloud();
-        break;
-      case 8:
+      case 6:
         library("history", "播放历史");
         break;
-      case 9:
+      case 7:
         library("favorites", "收藏");
         break;
-      case 10:
+      case 8:
         downloads();
         break;
       default:
@@ -238,13 +234,20 @@ public final class MainActivity extends Activity {
   }
 
   private void push(Runnable next) {
-    if (route != null) back.push(route);
+    if (currentPage != null) {
+      currentPage.scrollY(scroll.getScrollY());
+      back.push(currentPage);
+    }
     next.run();
   }
 
-  private int page(String title, Runnable again) {
+  private int page(String routeName, String title, JSONObject arguments, Runnable again) {
     generation++;
     route = again;
+    currentPage = new NavigationSnapshot(routeName, title, arguments);
+    catalogMore = null;
+    catalogLoading = false;
+    catalogFooter = null;
     body.removeAllViews();
     scroll.scrollTo(0, 0);
     heading = text(this, title, 30, TEXT);
@@ -256,7 +259,16 @@ public final class MainActivity extends Activity {
     return generation;
   }
 
+  private void loaded(Object data) {
+    if (currentPage != null) currentPage.data(data);
+  }
+
   private <T> void async(int token, Callable<T> work, Consumer<T> done) {
+    async(token, work, done, this::error);
+  }
+
+  private <T> void async(
+      int token, Callable<T> work, Consumer<T> done, Consumer<String> failed) {
     app.io.execute(
         () -> {
           try {
@@ -269,7 +281,7 @@ public final class MainActivity extends Activity {
             if (e instanceof ThreadDeath) throw (ThreadDeath) e;
             runOnUiThread(
                 () -> {
-                  if (!isFinishing() && generation == token) error(Json.message(e));
+                  if (!isFinishing() && generation == token) failed.accept(Json.message(e));
                 });
           }
         });
@@ -347,7 +359,10 @@ public final class MainActivity extends Activity {
         v -> Catalog.clean(v.optString("vod_name")),
         v -> v.optString("vod_remarks"),
         v -> v.optString("vod_pic"),
-        v -> push(() -> details(site, v)));
+        v -> {
+          if (Catalog.isIndex(site)) push(() -> searchPage(Catalog.clean(v.optString("vod_name"))));
+          else push(() -> details(site, v));
+        });
   }
 
   private void grid(
@@ -448,9 +463,14 @@ public final class MainActivity extends Activity {
   }
 
   private void home() {
-    int token = page("立即观看", this::home);
+    home(null);
+  }
+
+  private void home(JSONObject cached) {
+    int token = page("home", "现在观看", new JSONObject(), this::home);
+    if (cached == null) loaded(new JSONObject());
     List<JSONObject> sites = repo.sites();
-    List<JSONObject> histories = Json.objects(repo.list("history"));
+    List<JSONObject> histories = repo.visibleLibrary("history");
     if (!histories.isEmpty()) {
       JSONObject item = histories.get(0);
       if (!item.optBoolean("completed")) {
@@ -469,7 +489,7 @@ public final class MainActivity extends Activity {
     for (JSONObject s : sites)
       if (repo.settings.getBoolean("pin." + s.optString("id"), false)) pinned.add(s);
     if (!pinned.isEmpty()) {
-      sectionTitle("置顶来源");
+      sectionTitle("置顶点播源");
       sourceTiles(pinned);
     }
     if (!sites.isEmpty()) {
@@ -488,7 +508,7 @@ public final class MainActivity extends Activity {
               "⌄  " + chosen.optString("name"),
               () ->
                   choose(
-                      "选择推荐来源",
+                      "选择推荐点播源",
                       sites,
                       s -> s.optString("name"),
                       s -> {
@@ -500,25 +520,22 @@ public final class MainActivity extends Activity {
                       })),
           12);
       spaced(row, button(this, "刷新", this::home), 12);
-      loading();
-      async(
-          token,
-          () -> app.engine.call(chosen, new JSONObject()),
-          answer -> {
-            loaded();
-            categoryChips(chosen, answer);
-            recommendationRail(Catalog.videos(answer), chosen);
-            if (Catalog.videos(answer).isEmpty())
-              body.addView(
-                  button(
-                      this,
-                      "打开 " + chosen.optString("name"),
-                      () -> push(() -> site(chosen, "", 1, new JSONObject()))));
-          });
+      if (cached != null) showRecommendation(chosen, cached);
+      else {
+        loading();
+        async(
+            token,
+            () -> app.engine.call(chosen, new JSONObject()),
+            answer -> {
+              loaded();
+              loaded(answer);
+              showRecommendation(chosen, answer);
+            });
+      }
     }
-    if (repo.list("favorites").length() > 0) {
+    if (!repo.visibleLibrary("favorites").isEmpty()) {
       sectionTitle("收藏");
-      historyRail(Json.objects(repo.list("favorites")));
+      historyRail(repo.visibleLibrary("favorites"));
     }
     if (!repo.lives().isEmpty()) {
       sectionTitle("直播");
@@ -529,6 +546,17 @@ public final class MainActivity extends Activity {
           s -> push(() -> channels(s, "")),
           null);
     }
+  }
+
+  private void showRecommendation(JSONObject chosen, JSONObject answer) {
+    categoryChips(chosen, answer);
+    recommendationRail(Catalog.videos(answer), chosen);
+    if (Catalog.videos(answer).isEmpty())
+      body.addView(
+          button(
+              this,
+              "打开 " + chosen.optString("name"),
+              () -> push(() -> site(chosen, "", 1, new JSONObject()))));
   }
 
   private void homeHero(JSONObject item) {
@@ -607,7 +635,11 @@ public final class MainActivity extends Activity {
               video.optString("vod_pic"),
               138,
               207,
-              () -> push(() -> details(site, video))),
+              () -> {
+                if (Catalog.isIndex(site))
+                  push(() -> searchPage(Catalog.clean(video.optString("vod_name"))));
+                else push(() -> details(site, video));
+              }),
           18);
     body.addView(rail(this, row));
   }
@@ -616,28 +648,19 @@ public final class MainActivity extends Activity {
     tiles(
         sites,
         s -> s.optString("name"),
-        s -> s.optString("subscription") + " · " + runtimeName(s),
+        s -> s.optString("subscription"),
         s -> push(() -> site(s, "", 1, new JSONObject())),
         this::sourceMenu);
   }
 
-  private String runtimeName(JSONObject s) {
-    String api = s.optString("api");
-    return s.optInt("type") == 0
-        ? "XML"
-        : s.optInt("type") == 1 || s.optInt("type") == 4
-            ? "JSON"
-            : api.startsWith("csp_") ? "JAR" : api.contains(".py") ? "Python" : "JavaScript";
-  }
-
   private void sources() {
-    page("来源", this::sources);
+    page("sources", "点播源", new JSONObject(), this::sources);
     List<JSONObject> sites = repo.sites();
     if (sites.isEmpty()) {
-      empty("▦", "连接点播订阅", "在设置中添加 TVBox 订阅，来源会显示在这里。", "添加订阅", this::importDialog);
+      empty("▦", "连接点播订阅", "在设置中添加 TVBox 订阅，点播源会显示在这里。", "添加订阅", this::importDialog);
       return;
     }
-    TextView info = text(this, sites.size() + " 个来源 · 长按确定键可置顶或隐藏", 14, SECONDARY);
+    TextView info = text(this, sites.size() + " 个点播源 · 长按确定键可置顶或隐藏", 14, SECONDARY);
     body.addView(info);
     gap(body, 18);
     sourceTiles(sites);
@@ -648,7 +671,7 @@ public final class MainActivity extends Activity {
     new AlertDialog.Builder(this)
         .setTitle(s.optString("name"))
         .setItems(
-            new String[] {pin ? "取消置顶" : "置顶来源", "隐藏来源"},
+            new String[] {pin ? "取消置顶" : "置顶点播源", "隐藏点播源"},
             (d, i) -> {
               repo.settings
                   .edit()
@@ -675,13 +698,23 @@ public final class MainActivity extends Activity {
   }
 
   private void site(JSONObject source, String category, int pg, JSONObject filters) {
-    int token = page(source.optString("name"), () -> site(source, category, pg, filters));
+    site(source, category, pg, filters, null);
+  }
+
+  private void site(
+      JSONObject source, String category, int pg, JSONObject filters, CatalogPages cached) {
+    int token =
+        page(
+            "site",
+            source.optString("name"),
+            Json.obj("source", source, "category", category, "page", pg, "filters", filters),
+            () -> site(source, category, pg, filters));
     LinearLayout row = actions();
     spaced(
         row,
         button(
             this,
-            "⌕  搜索此来源",
+            "⌕  搜索此点播源",
             () ->
                 input(
                     "搜索 " + source.optString("name"),
@@ -690,16 +723,50 @@ public final class MainActivity extends Activity {
                     q -> push(() -> sourceSearch(source, q, 1)))),
         10);
     spaced(row, button(this, "刷新", () -> site(source, category, pg, filters)), 10);
+    if (cached != null) {
+      siteFilters(source, category, filters, cached.firstAnswer());
+      videoGrid(cached.videos(), source);
+      loaded(cached);
+      installCatalogMore(
+          cached,
+          category.isEmpty()
+              ? null
+              : () -> requestSitePage(
+                  generation, source, category, cached.nextPage(), filters, cached, false));
+      return;
+    }
+    CatalogPages pages = new CatalogPages();
     loading();
+    requestSitePage(token, source, category, pg, filters, pages, true);
+  }
+
+  private void requestSitePage(
+      int token,
+      JSONObject source,
+      String category,
+      int pg,
+      JSONObject filters,
+      CatalogPages pages,
+      boolean initial) {
+    if (catalogLoading) return;
+    catalogLoading = true;
+    catalogMore = null;
+    if (!initial && catalogFooter != null) catalogFooter.setText("正在加载更多…");
     JSONObject params =
-        category.isEmpty()
-            ? new JSONObject()
-            : Json.obj("t", category, "pg", "" + pg, "filters", filters.toString());
+        category.isEmpty() ? new JSONObject() : Json.obj("t", category, "pg", "" + pg);
+    JSONObject filterParameters = Catalog.filterParameters(source, filters);
+    if (filterParameters != null)
+      for (String key : Json.keys(filterParameters))
+        try {
+          params.put(key, filterParameters.get(key));
+        } catch (JSONException broken) {
+          throw new IllegalStateException("无法设置分类筛选", broken);
+        }
     async(
         token,
         () -> {
           JSONObject answer = app.engine.call(source, params);
-          if (!category.isEmpty()) {
+          if (!category.isEmpty() && initial) {
             JSONObject home = app.engine.call(source, new JSONObject());
             answer.put("class", home.opt("class")).put("filters", home.opt("filters"));
           }
@@ -707,64 +774,156 @@ public final class MainActivity extends Activity {
         },
         answer -> {
           loaded();
-          categoryChips(source, answer);
-          JSONObject filterMap =
-              answer.opt("filters") instanceof String
-                  ? Json.object(answer.optString("filters"))
-                  : Json.child(answer, "filters");
-          for (JSONObject filter : Json.objects(Json.array(filterMap.opt(category)))) {
-            LinearLayout chips = actions();
-            String key = filter.optString("key");
-            spaced(chips, text(this, filter.optString("name"), 14, SECONDARY), 12);
-            for (JSONObject choice : Json.objects(Json.array(filter.opt("value"))))
-              spaced(
-                  chips,
-                  button(
-                      this,
-                      (filters.optString(key).equals(choice.optString("v")) ? "✓ " : "")
-                          + choice.optString("n"),
-                      () -> {
-                        JSONObject next = Json.copy(filters);
-                        try {
-                          next.put(key, choice.optString("v"));
-                        } catch (Exception ignored) {
-                        }
-                        site(source, category, 1, next);
-                      }),
-                  8);
-          }
-          List<JSONObject> videos = Catalog.videos(answer);
-          if (videos.isEmpty()) empty("▦", "暂无内容", "尝试其他分类或刷新此来源。", "重试", route);
-          else videoGrid(videos, source);
-          pagination(
-              pg,
-              answer.optInt("pagecount", videos.isEmpty() ? pg : pg + 1),
-              p -> site(source, category, p, filters));
+          catalogLoading = false;
+          List<JSONObject> added = pages.append(answer, pg);
+          if (initial) siteFilters(source, category, filters, answer);
+          if (initial && pages.videos().isEmpty())
+            empty("▦", "暂无内容", "尝试其他分类或刷新此点播源。", "重试", route);
+          else videoGrid(added, source);
+          loaded(pages);
+          installCatalogMore(
+              pages,
+              category.isEmpty()
+                  ? null
+                  : () -> requestSitePage(
+                      generation, source, category, pages.nextPage(), filters, pages, false));
+          scroll.post(this::maybeLoadMore);
+        },
+        message -> {
+          catalogLoading = false;
+          if (initial) error(message);
+          else
+            installCatalogRetry(
+                pages,
+                message,
+                () -> requestSitePage(
+                    generation, source, category, pg, filters, pages, false));
         });
   }
 
+  private void siteFilters(
+      JSONObject source, String category, JSONObject filters, JSONObject answer) {
+    categoryChips(source, answer);
+    JSONObject filterMap =
+        answer.opt("filters") instanceof String
+            ? Json.object(answer.optString("filters"))
+            : Json.child(answer, "filters");
+    for (JSONObject filter : Json.objects(Json.array(filterMap.opt(category)))) {
+      LinearLayout chips = actions();
+      String key = filter.optString("key");
+      spaced(chips, text(this, filter.optString("name"), 14, SECONDARY), 12);
+      for (JSONObject choice : Json.objects(Json.array(filter.opt("value"))))
+        spaced(
+            chips,
+            button(
+                this,
+                (filters.optString(key).equals(choice.optString("v")) ? "✓ " : "")
+                    + choice.optString("n"),
+                () -> {
+                  JSONObject next = Json.copy(filters);
+                  try {
+                    next.put(key, choice.optString("v"));
+                  } catch (JSONException broken) {
+                    throw new IllegalStateException("无法设置分类筛选", broken);
+                  }
+                  site(source, category, 1, next);
+                }),
+            8);
+    }
+  }
+
   private void sourceSearch(JSONObject site, String query, int pg) {
-    int token = page(site.optString("name") + " · " + query, () -> sourceSearch(site, query, pg));
+    sourceSearch(site, query, pg, null);
+  }
+
+  private void sourceSearch(JSONObject site, String query, int pg, CatalogPages cached) {
+    int token =
+        page(
+            "sourceSearch",
+            site.optString("name") + " · " + query,
+            Json.obj("site", site, "query", query, "page", pg),
+            () -> sourceSearch(site, query, pg));
+    if (cached != null) {
+      videoGrid(cached.videos(), site);
+      loaded(cached);
+      installCatalogMore(cached, () -> requestSourceSearchPage(
+          generation, site, query, cached.nextPage(), cached, false));
+      return;
+    }
+    CatalogPages pages = new CatalogPages();
     loading();
+    requestSourceSearchPage(token, site, query, pg, pages, true);
+  }
+
+  private void requestSourceSearchPage(
+      int token, JSONObject site, String query, int pg, CatalogPages pages, boolean initial) {
+    if (catalogLoading) return;
+    catalogLoading = true;
+    catalogMore = null;
+    if (!initial && catalogFooter != null) catalogFooter.setText("正在加载更多…");
     async(
         token,
         () -> app.engine.call(site, Json.obj("wd", query, "pg", "" + pg)),
         answer -> {
           loaded();
-          List<JSONObject> videos = Catalog.videos(answer);
-          videoGrid(videos, site);
-          if (videos.isEmpty())
+          catalogLoading = false;
+          List<JSONObject> added = pages.append(answer, pg);
+          videoGrid(added, site);
+          if (initial && pages.videos().isEmpty())
             empty(
                 "⌕",
                 "没有匹配的内容",
                 "换一个关键词再试。",
                 "重新搜索",
                 () -> input("搜索", "关键词", query, q -> sourceSearch(site, q, 1)));
-          pagination(
-              pg,
-              answer.optInt("pagecount", videos.isEmpty() ? pg : pg + 1),
-              p -> sourceSearch(site, query, p));
+          loaded(pages);
+          installCatalogMore(
+              pages,
+              () -> requestSourceSearchPage(
+                  generation, site, query, pages.nextPage(), pages, false));
+          scroll.post(this::maybeLoadMore);
+        },
+        message -> {
+          catalogLoading = false;
+          if (initial) error(message);
+          else
+            installCatalogRetry(
+                pages,
+                message,
+                () -> requestSourceSearchPage(generation, site, query, pg, pages, false));
         });
+  }
+
+  private void installCatalogMore(CatalogPages pages, Runnable next) {
+    if (catalogFooter != null) body.removeView(catalogFooter);
+    catalogFooter = null;
+    catalogMore = pages.hasMore() ? next : null;
+    if (pages.page() == 0 || (pages.hasMore() && next == null)) return;
+    catalogFooter =
+        button(
+            this,
+            pages.hasMore() && next != null
+                ? "加载更多 · 第 " + pages.page() + " / " + pages.totalPages() + " 页"
+                : "已加载全部 " + pages.videos().size() + " 项",
+            () -> {
+              if (catalogMore != null) catalogMore.run();
+            });
+    body.addView(catalogFooter);
+  }
+
+  private void installCatalogRetry(CatalogPages pages, String message, Runnable retry) {
+    if (catalogFooter != null) body.removeView(catalogFooter);
+    catalogMore = retry;
+    catalogFooter = button(this, "加载失败：" + message + " · 点击重试", retry);
+    body.addView(catalogFooter);
+  }
+
+  private void maybeLoadMore() {
+    if (restoringSnapshot || catalogMore == null || catalogLoading || scroll.getChildCount() == 0)
+      return;
+    View child = scroll.getChildAt(0);
+    if (child.getBottom() <= scroll.getScrollY() + scroll.getHeight() + dp(this, 360))
+      catalogMore.run();
   }
 
   private void pagination(int pg, int total, Consumer<Integer> go) {
@@ -775,7 +934,21 @@ public final class MainActivity extends Activity {
   }
 
   private void details(JSONObject site, JSONObject listed) {
-    int token = page("详情", () -> details(site, listed));
+    details(site, listed, null);
+  }
+
+  private void details(JSONObject site, JSONObject listed, JSONObject cached) {
+    int token =
+        page(
+            "details",
+            "详情",
+            Json.obj("site", site, "listed", listed),
+            () -> details(site, listed));
+    if (cached != null) {
+      loaded(cached);
+      renderDetails(site, listed, cached);
+      return;
+    }
     loading();
     async(
         token,
@@ -783,13 +956,19 @@ public final class MainActivity extends Activity {
           if (site.length() == 0 || listed.optString("vod_id").isEmpty()) return listed;
           JSONObject r = app.engine.call(site, Json.obj("ids", listed.optString("vod_id")));
           List<JSONObject> list = Catalog.videos(r);
-          if (list.isEmpty()) throw new IOException("此来源没有返回影片详情");
+          if (list.isEmpty()) throw new IOException("此点播源没有返回影片详情");
           JSONObject v = list.get(0);
           if (v.optString("vod_pic").isEmpty()) v.put("vod_pic", listed.optString("vod_pic"));
           return v;
         },
         video -> {
           loaded();
+          loaded(video);
+          renderDetails(site, listed, video);
+        });
+  }
+
+  private void renderDetails(JSONObject site, JSONObject listed, JSONObject video) {
           if (video.optString("vod_tag").equals("folder")) {
             site(site, video.optString("vod_id"), 1, new JSONObject());
             return;
@@ -857,7 +1036,7 @@ public final class MainActivity extends Activity {
           gap(body, 24);
           if (episodes.isEmpty()) {
             if (!video.optString("action").isEmpty())
-              body.addView(button(this, "打开来源设置", () -> toast("请使用来源提供的登录入口")));
+              body.addView(button(this, "打开点播源设置", () -> toast("请使用点播源提供的登录入口")));
             else body.addView(text(this, "此内容暂未提供可播放的集数", 16, SECONDARY));
             return;
           }
@@ -876,7 +1055,6 @@ public final class MainActivity extends Activity {
                     () -> episodeButtons(episodeContainer, site, video, entry.getValue())),
                 10);
           episodeButtons(episodeContainer, site, video, lines.values().iterator().next());
-        });
   }
 
   private void episodeButtons(
@@ -928,28 +1106,38 @@ public final class MainActivity extends Activity {
             play.put(
                 "position",
                 !sameEpisode || history.optBoolean("completed") ? 0 : history.optLong("position"));
-          } catch (Exception ignored) {
+          } catch (JSONException error) {
+            android.util.Log.e("Yingxia.Main", "Cannot restore episode progress", error);
+            toast("无法恢复播放进度，未开始播放");
+            return;
           }
           PlayerActivity.open(this, play);
         });
   }
 
+  private static boolean resumable(JSONObject item) {
+    return PlaybackHistory.resumable(item);
+  }
+
   private void resume(JSONObject saved) {
     if (saved.has("cloudServer")) {
-      int token = generation;
+      toast("网盘功能已移除，此旧记录可在管理中删除");
+      return;
+    } else if (saved.optBoolean("music")) {
       async(
-          token,
-          () -> app.cloud.stream(Json.child(saved, "cloudServer"), Json.child(saved, "cloudFile")),
-          play -> {
-            try {
-              play.put("position", saved.optLong("position"));
-            } catch (Exception ignored) {
-            }
-            PlayerActivity.open(this, play);
-          });
-    } else if (saved.has("site") && Json.child(saved, "site").length() > 0)
+          generation,
+          () -> {
+            JSONObject play = new MusicClient().play(saved);
+            play.put("position", saved.optBoolean("completed") ? 0 : saved.optLong("position"));
+            return play;
+          },
+          play -> PlayerActivity.open(this, play));
+    } else if (Json.child(saved, "site").length() > 0) {
       async(generation, () -> app.engine.resume(saved), play -> PlayerActivity.open(this, play));
-    else PlayerActivity.open(this, saved);
+    } else {
+      android.util.Log.w("Yingxia.Main", "History entry has no resolvable catalog identity");
+      toast("此记录缺少点播源信息，无法重新解析播放地址");
+    }
   }
 
   private void historyRail(List<JSONObject> entries) {
@@ -965,7 +1153,7 @@ public final class MainActivity extends Activity {
               138,
               207,
               () -> {
-                if (item.has("url")) resume(item);
+                if (item.has("cloudServer") || resumable(item)) resume(item);
                 else push(() -> details(Json.child(item, "site"), Json.child(item, "video")));
               });
       v.setOnLongClickListener(
@@ -979,15 +1167,15 @@ public final class MainActivity extends Activity {
   }
 
   private void library(String key, String title) {
-    page(title, () -> library(key, title));
-    List<JSONObject> entries = Json.objects(repo.list(key));
+    page("library", title, Json.obj("key", key, "title", title), () -> library(key, title));
+    List<JSONObject> entries = repo.visibleLibrary(key);
     if (entries.isEmpty()) {
       empty(
           key.equals("favorites") ? "♡" : "◷",
           key.equals("favorites") ? "收藏喜欢的内容" : "还没有播放记录",
           key.equals("favorites") ? "在详情页收藏影片，在这里随时找到。" : "你观看的内容和进度会保存在这里。",
-          "浏览来源",
-          () -> select(6));
+          "浏览点播源",
+          () -> select(5));
       return;
     }
     LinearLayout row = actions();
@@ -1012,7 +1200,7 @@ public final class MainActivity extends Activity {
         s -> s.optString("episode"),
         s -> s.optString("poster"),
         s -> {
-          if (s.has("url")) resume(s);
+          if (s.has("cloudServer") || resumable(s)) resume(s);
           else push(() -> details(Json.child(s, "site"), Json.child(s, "video")));
         });
   }
@@ -1023,8 +1211,10 @@ public final class MainActivity extends Activity {
         .setItems(
             new String[] {"打开", "从历史中移除", "收藏 / 取消收藏"},
             (d, i) -> {
-              if (i == 0) resume(item);
-              else if (i == 1) {
+              if (i == 0) {
+                if (item.has("cloudServer") || resumable(item)) resume(item);
+                else push(() -> details(Json.child(item, "site"), Json.child(item, "video")));
+              } else if (i == 1) {
                 repo.remove("history", item.optString("id"));
                 route.run();
               } else {
@@ -1036,7 +1226,11 @@ public final class MainActivity extends Activity {
   }
 
   private void live() {
-    page("直播", this::live);
+    page("live", "直播", new JSONObject(), this::live);
+    sectionTitle("内置电台");
+    body.addView(button(this, "♫ ItaloDance · 意大利舞曲电台", () -> RadioActivity.open(this)));
+    gap(body, 18);
+    sectionTitle("电视直播");
     List<JSONObject> sources = repo.lives();
     if (sources.isEmpty()) {
       empty("◉", "连接直播订阅", "添加包含直播的 TVBox 订阅，或导入 M3U / TXT 播放列表。", "添加订阅", this::importDialog);
@@ -1050,31 +1244,22 @@ public final class MainActivity extends Activity {
         null);
   }
 
-  private List<JSONObject> loadChannels(JSONObject source) throws Exception {
-    List<JSONObject> out = new ArrayList<>();
+  private static final class ChannelLoad {
+    final List<JSONObject> items;
+    final int invalidChannels, invalidHeaders;
+
+    ChannelLoad(List<JSONObject> items, int invalidChannels, int invalidHeaders) {
+      this.items = items;
+      this.invalidChannels = invalidChannels;
+      this.invalidHeaders = invalidHeaders;
+    }
+  }
+
+  private ChannelLoad loadChannels(JSONObject source) throws Exception {
+    List<JSONObject> inline = LiveChannels.fromInline(source);
+    if (!inline.isEmpty()) return new ChannelLoad(inline, 0, 0);
     Map<String, String> headers = Json.headers(source.optJSONObject("header"));
     if (source.has("ua")) headers.put("User-Agent", source.optString("ua"));
-    for (JSONObject group : Json.objects(Json.array(source.opt("channels")))) {
-      if (group.has("urls")) {
-        JSONArray urls = Json.array(group.opt("urls"));
-        if (urls.length() > 0)
-          out.add(
-              Json.obj(
-                  "id",
-                  group.optString("name") + urls.optString(0),
-                  "name",
-                  group.optString("name"),
-                  "url",
-                  urls.optString(0),
-                  "group",
-                  source.optString("name"),
-                  "header",
-                  new JSONObject(headers),
-                  "live",
-                  true));
-      }
-    }
-    if (!out.isEmpty()) return out;
     String url = source.optString("url");
     if (url.startsWith("proxy://")) {
       Uri parsed = Uri.parse(url);
@@ -1087,61 +1272,102 @@ public final class MainActivity extends Activity {
     }
     Http.Result result =
         app.http.get(ConfigCodec.address(url, source.optString("origin")), headers);
-    out = PlaylistParser.parse(result.text(), result.url, headers);
-    if (out.isEmpty()) throw new IOException("播放列表中没有找到可用频道");
-    return out;
+    PlaylistParser.Result parsed = PlaylistParser.parseWithStats(result.text(), result.url, headers);
+    if (parsed.getChannels().isEmpty())
+      throw new IOException(
+          "播放列表中没有找到可用频道"
+              + (parsed.getInvalidChannels() > 0
+                  ? "，" + parsed.getInvalidChannels() + " 个频道地址无效"
+                  : ""));
+    return new ChannelLoad(
+        parsed.getChannels(), parsed.getInvalidChannels(), parsed.getInvalidHeaders());
   }
 
   private void channels(JSONObject source, String selected) {
-    int token = page(source.optString("name", "直播"), () -> channels(source, selected));
+    channels(source, selected, null);
+  }
+
+  private void channels(JSONObject source, String selected, ChannelLoad cached) {
+    int token =
+        page(
+            "channels",
+            source.optString("name", "直播"),
+            Json.obj("source", source, "selected", selected),
+            () -> channels(source, selected));
+    if (cached != null) {
+      loaded(cached);
+      renderChannels(source, selected, cached);
+      return;
+    }
     loading();
     async(
         token,
         () -> loadChannels(source),
-        items -> {
+        loadedChannels -> {
           loaded();
-          LinearLayout filters = actions();
-          LinkedHashSet<String> groups = new LinkedHashSet<>();
-          groups.add("");
-          for (JSONObject c : items) groups.add(c.optString("group"));
-          for (String group : groups)
-            spaced(
-                filters,
-                button(
-                    this,
-                    (group.equals(selected) ? "✓ " : "") + (group.isEmpty() ? "全部" : group),
-                    () -> channels(source, group)),
-                10);
-          List<JSONObject> shown = new ArrayList<>();
-          for (JSONObject c : items)
-            if (selected.isEmpty() || selected.equals(c.optString("group"))) shown.add(c);
-          TextView count = text(this, shown.size() + " 个频道", 14, SECONDARY);
-          body.addView(count);
-          gap(body, 16);
-          tiles(
-              shown,
-              c -> c.optString("name"),
-              c -> c.optString("group"),
-              channel -> {
-                JSONObject play = Json.copy(channel);
-                try {
-                  play.put("episodes", new JSONArray(items))
-                      .put("poster", channel.optString("logo"));
-                } catch (Exception ignored) {
-                }
-                PlayerActivity.open(this, play);
-              },
-              c -> {
-                repo.favorite(c);
-                toast("已更新收藏");
-              });
+          loaded(loadedChannels);
+          renderChannels(source, selected, loadedChannels);
+        });
+  }
+
+  private void renderChannels(JSONObject source, String selected, ChannelLoad load) {
+    List<JSONObject> items = load.items;
+    LinearLayout filters = actions();
+    LinkedHashSet<String> groups = new LinkedHashSet<>();
+    groups.add("");
+    for (JSONObject c : items) groups.add(c.optString("group"));
+    for (String group : groups)
+      spaced(
+          filters,
+          button(
+              this,
+              (group.equals(selected) ? "✓ " : "") + (group.isEmpty() ? "全部" : group),
+              () -> channels(source, group, load)),
+          10);
+    List<JSONObject> shown = new ArrayList<>();
+    for (JSONObject c : items)
+      if (selected.isEmpty() || selected.equals(c.optString("group"))) shown.add(c);
+    String invalid =
+        (load.invalidChannels > 0 ? " · " + load.invalidChannels + " 个频道地址无效" : "")
+            + (load.invalidHeaders > 0 ? " · " + load.invalidHeaders + " 个请求头已回退" : "");
+    TextView count = text(this, shown.size() + " 个频道" + invalid, 14, SECONDARY);
+    body.addView(count);
+    gap(body, 16);
+    tiles(
+        shown,
+        c -> c.optString("name"),
+        c -> c.optString("group"),
+        channel -> {
+          JSONObject play = Json.copy(channel);
+          try {
+            Object lines = channel.has("episodes") ? channel.opt("episodes") : new JSONArray(items);
+            play.put("episodes", lines).put("poster", channel.optString("logo"));
+          } catch (JSONException broken) {
+            android.util.Log.e("Yingxia.Main", "Cannot prepare live channels", broken);
+            toast("无法准备频道线路");
+            return;
+          }
+          PlayerActivity.open(this, play);
+        },
+        c -> {
+          repo.favorite(c);
+          toast("已更新收藏");
         });
   }
 
   private void searchPage(String initial) {
-    int token = page("全局搜索", () -> searchPage(initial));
+    searchPage(initial, null);
+  }
+
+  private void searchPage(String initial, SearchSnapshot cached) {
+    int token =
+        page(
+            "search",
+            "全局搜索",
+            Json.obj("initial", initial),
+            () -> searchPage(initial));
     LinearLayout entry = horizontal(this);
-    EditText input = edit("搜索全部来源", initial);
+    EditText input = edit("搜索全部点播源", initial);
     entry.addView(input, new LinearLayout.LayoutParams(0, dp(this, 52), 1));
     spaced(
         entry,
@@ -1163,8 +1389,38 @@ public final class MainActivity extends Activity {
           return false;
         });
     gap(body, 18);
-    if (initial.isEmpty()) empty("⌕", "一次搜索，汇集所有来源", "输入影片、剧集或演员名称，搜索结果会陆续显示。", null, null);
+    if (cached != null) {
+      loaded(cached);
+      renderSearchSnapshot(cached);
+    } else if (initial.isEmpty())
+      empty("⌕", "一次搜索，汇集所有点播源", "输入影片、剧集或演员名称，搜索结果会陆续显示。", null, null);
     else performSearch(initial);
+  }
+
+  private void renderSearchSnapshot(SearchSnapshot search) {
+    body.addView(text(this, search.status(), 14, SECONDARY));
+    gap(body, 16);
+    for (SearchSnapshot.Result result : search.results())
+      appendSearchResult(result.site, result.videos);
+  }
+
+  private void appendSearchResult(JSONObject site, List<JSONObject> shown) {
+    if (!repo.isSourceVisible(site)) return;
+    sectionTitle(site.optString("name"));
+    LinearLayout row = horizontal(this);
+    for (JSONObject video : shown.subList(0, Math.min(12, shown.size())))
+      spaced(
+          row,
+          card(
+              this,
+              video.optString("vod_name"),
+              video.optString("vod_remarks"),
+              video.optString("vod_pic"),
+              130,
+              195,
+              () -> push(() -> details(site, video))),
+          16);
+    body.addView(rail(this, row));
   }
 
   private void performSearch(String query) {
@@ -1173,88 +1429,90 @@ public final class MainActivity extends Activity {
     while (body.getChildCount() > 4) body.removeViewAt(4);
     List<JSONObject> sites = repo.sites();
     if (sites.isEmpty()) {
-      empty("⌕", "先添加一个订阅", "添加点播来源后即可搜索。", "添加订阅", this::importDialog);
+      empty("⌕", "先添加一个订阅", "添加点播源后即可搜索。", "添加订阅", this::importDialog);
       return;
     }
-    TextView status = text(this, "正在搜索 " + sites.size() + " 个来源…", 14, SECONDARY);
+    // Sources in a failure cooldown stay out of this search; a retry asks them again.
+    SourceHealth health = SourceHealth.shared();
+    List<JSONObject> asked = new ArrayList<>();
+    int paused = 0;
+    for (JSONObject site : sites)
+      if (health.shouldSkip(SourceHealth.key(site)))
+        paused++;
+      else asked.add(site);
+    TextView status =
+        text(
+            this,
+            "正在搜索 " + asked.size() + " 个点播源…" + (paused > 0 ? " · " + paused + " 个冷却中" : ""),
+            14,
+            SECONDARY);
     body.addView(status);
     gap(body, 16);
-    final int[] complete = {0}, failures = {0};
-    for (JSONObject site : sites) {
+    SearchSnapshot search = new SearchSnapshot(query, asked.size(), paused);
+    currentPage = new NavigationSnapshot("search", "全局搜索", Json.obj("initial", query));
+    route = () -> searchPage(query);
+    loaded(search);
+    for (JSONObject site : asked) {
+      String healthKey = SourceHealth.key(site);
       app.io.execute(
           () -> {
             try {
               List<JSONObject> videos =
                   Catalog.videos(app.engine.call(site, Json.obj("wd", query, "pg", "1")));
+              health.recordSuccess(healthKey);
+              // The titles that are what was searched for lead; the rest follow, none hidden.
+              videos = TitleMatch.ordered(videos, query, v -> v.optString("vod_name"));
+              final List<JSONObject> shown = videos;
               runOnUiThread(
                   () -> {
                     if (generation != token) return;
-                    complete[0]++;
-                    status.setText(
-                        "已搜索 "
-                            + complete[0]
-                            + " / "
-                            + sites.size()
-                            + " 个来源"
-                            + (failures[0] > 0 ? " · " + failures[0] + " 个暂不可用" : ""));
-                    if (!videos.isEmpty()) {
-                      sectionTitle(site.optString("name"));
-                      LinearLayout row = horizontal(this);
-                      for (JSONObject video : videos.subList(0, Math.min(12, videos.size())))
-                        spaced(
-                            row,
-                            card(
-                                this,
-                                video.optString("vod_name"),
-                                video.optString("vod_remarks"),
-                                video.optString("vod_pic"),
-                                130,
-                                195,
-                                () -> push(() -> details(site, video))),
-                            16);
-                      body.addView(rail(this, row));
-                    }
+                    search.success(site, shown);
+                    status.setText(search.status());
+                    if (!shown.isEmpty()) appendSearchResult(site, shown);
                   });
-            } catch (Throwable e) {
+            } catch (Exception e) {
+              // A busy local runtime is backpressure, not evidence that the remote source failed.
+              if (!JarCallGuard.isBusy(e)) health.recordFailure(healthKey);
               runOnUiThread(
                   () -> {
                     if (generation != token) return;
-                    complete[0]++;
-                    failures[0]++;
-                    status.setText(
-                        "已搜索 "
-                            + complete[0]
-                            + " / "
-                            + sites.size()
-                            + " 个来源 · "
-                            + failures[0]
-                            + " 个暂不可用");
+                    search.failure();
+                    status.setText(search.status());
                   });
             }
           });
     }
   }
 
+  private String discoverLanguage() {
+    return DiscoverCatalog.language(repo.settings.getString("appLanguage", ""), Locale.getDefault());
+  }
+
   private void discover(String feed, int pg) {
-    int token = page("发现", () -> discover(feed, pg));
+    discover(feed, pg, null);
+  }
+
+  private void discover(String feed, int pg, JSONObject cached) {
+    int token =
+        page(
+            "discover",
+            "发现",
+            Json.obj("feed", feed, "page", pg),
+            () -> discover(feed, pg));
     LinearLayout filters = actions();
-    String[][] options = {
-      {"featured", "精选"},
-      {"trending", "热门"},
-      {"movies", "电影"},
-      {"television", "剧集"},
-      {"animation", "动漫"},
-      {"chinese", "华语"},
-      {"variety", "综艺"},
-      {"upcoming", "即将上映"},
-      {"topMovies", "高分电影"}
-    };
-    for (String[] option : options)
+    for (JSONObject option : DiscoverCatalog.feeds())
       spaced(
           filters,
           button(
-              this, (option[0].equals(feed) ? "✓ " : "") + option[1], () -> discover(option[0], 1)),
+              this,
+              (option.optString("feed").equals(feed) ? "✓ " : "") + option.optString("name"),
+              () -> discover(option.optString("feed"), 1)),
           10);
+    if (cached != null) {
+      loaded(cached);
+      renderDiscover(feed, pg, cached);
+      return;
+    }
     loading();
     async(
         token,
@@ -1262,28 +1520,69 @@ public final class MainActivity extends Activity {
             app.http.json(
                 Http.query(
                     "https://yingxia-tmdb.getmegaportal.com/v1/catalog",
-                    Http.params("feed", feed, "page", "" + pg, "language", "zh-CN"))),
+                    Http.params("feed", feed, "page", "" + pg, "language", discoverLanguage()))),
         answer -> {
           loaded();
-          List<JSONObject> items = Json.objects(Json.array(answer.opt("items")));
-          if (items.isEmpty()) empty("◈", "暂时没有内容", "稍后刷新再试。", "刷新", route);
-          else
-            grid(
-                items,
-                s -> s.optString("name"),
-                s ->
-                    s.optString("year")
-                        + (s.optDouble("rating", 0) > 0
-                            ? "  ★ " + String.format(Locale.ROOT, "%.1f", s.optDouble("rating"))
-                            : ""),
-                s -> s.optString("poster"),
-                s -> push(() -> discoverDetail(s)));
-          pagination(pg, answer.optInt("totalPages", pg), p -> discover(feed, p));
+          loaded(answer);
+          renderDiscover(feed, pg, answer);
         });
   }
 
+  private void renderDiscover(String feed, int pg, JSONObject answer) {
+    List<JSONObject> items = Json.objects(Json.array(answer.opt("items")));
+    if (items.isEmpty()) empty("◈", "暂时没有内容", "稍后刷新再试。", "刷新", route);
+    else
+      grid(
+          items,
+          s -> s.optString("name"),
+          s ->
+              s.optString("year")
+                  + (s.optDouble("rating", 0) > 0
+                      ? "  ★ " + String.format(Locale.ROOT, "%.1f", s.optDouble("rating"))
+                      : ""),
+          s -> s.optString("poster"),
+          s -> push(() -> discoverDetail(s)));
+    pagination(pg, answer.optInt("totalPages", pg), p -> discover(feed, p));
+  }
+
   private void discoverDetail(JSONObject item) {
-    page(item.optString("name"), () -> discoverDetail(item));
+    discoverDetail(item, null);
+  }
+
+  private void discoverDetail(JSONObject item, JSONObject cached) {
+    int token =
+        page(
+            "discoverDetail",
+            item.optString("name"),
+            Json.obj("item", item),
+            () -> discoverDetail(item));
+    if (cached != null) {
+      loaded(cached);
+      renderDiscoverDetail(cached);
+      return;
+    }
+    loading();
+    async(
+        token,
+        () -> {
+          JSONObject details =
+              app.http.json(
+                  Http.query(
+                      DiscoverCatalog.DETAILS_ENDPOINT,
+                      DiscoverCatalog.detailsParameters(
+                          item.optString("mediaType", "movie"),
+                          item.optString("id"),
+                          discoverLanguage())));
+          return DiscoverCatalog.mergeDetails(item, details);
+        },
+        details -> {
+          loaded();
+          loaded(details);
+          renderDiscoverDetail(details);
+        });
+  }
+
+  private void renderDiscoverDetail(JSONObject item) {
     LinearLayout hero = horizontal(this);
     hero.setGravity(Gravity.TOP);
     ImageView image = new ImageView(this);
@@ -1293,34 +1592,114 @@ public final class MainActivity extends Activity {
     LinearLayout info = vertical(this);
     pad(info, 28, 8);
     info.addView(text(this, item.optString("name"), 34, TEXT));
+    if (!item.optString("tagline").isEmpty()) {
+      gap(info, 8);
+      info.addView(text(this, item.optString("tagline"), 17, SECONDARY));
+    }
     gap(info, 12);
-    info.addView(
-        text(
-            this,
-            item.optString("year")
-                + " · ★ "
-                + String.format(Locale.ROOT, "%.1f", item.optDouble("rating")),
-            17,
-            SECONDARY));
+    List<String> facts = new ArrayList<>();
+    if (!item.optString("year").isEmpty()) facts.add(item.optString("year"));
+    if (item.optDouble("rating", 0) > 0)
+      facts.add(
+          "★ "
+              + String.format(Locale.ROOT, "%.1f", item.optDouble("rating"))
+              + (item.optInt("voteCount") > 0 ? "（" + item.optInt("voteCount") + " 人评分）" : ""));
+    if (item.optDouble("runtime", 0) > 0)
+      facts.add(String.format(Locale.ROOT, "%.0f 分钟", item.optDouble("runtime")));
+    if (!item.optString("status").isEmpty()) facts.add(item.optString("status"));
+    info.addView(text(this, String.join(" · ", facts), 17, SECONDARY));
+    String genres = names(item.opt("genres"), "");
+    String countries = names(item.opt("countries"), "");
+    if (!genres.isEmpty() || !countries.isEmpty()) {
+      gap(info, 10);
+      List<String> classification = new ArrayList<>();
+      if (!genres.isEmpty()) classification.add(genres);
+      if (!countries.isEmpty()) classification.add(countries);
+      info.addView(text(this, String.join(" · ", classification), 15, SECONDARY));
+    }
     gap(info, 18);
     info.addView(text(this, item.optString("overview"), 16, SECONDARY));
     gap(info, 24);
-    info.addView(button(this, "⌕  在全部来源中查找", () -> push(() -> searchPage(item.optString("name")))));
+    info.addView(button(this, "⌕  在全部点播源中查找", () -> push(() -> searchPage(item.optString("name")))));
     hero.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
     body.addView(hero);
+    String cast = names(item.opt("cast"), "name");
+    if (!cast.isEmpty()) {
+      sectionTitle("演员");
+      body.addView(text(this, cast, 15, SECONDARY));
+    }
+    String studios = names(item.opt("studios"), "name");
+    if (!studios.isEmpty()) {
+      sectionTitle("制作与播出");
+      body.addView(text(this, studios, 15, SECONDARY));
+    }
+    List<JSONObject> seasons = Json.objects(Json.array(item.opt("seasons")));
+    if (!seasons.isEmpty()) {
+      sectionTitle("季");
+      body.addView(text(this, names(item.opt("seasons"), "name"), 15, SECONDARY));
+    }
+    List<JSONObject> recommendations = Json.objects(Json.array(item.opt("recommendations")));
+    if (!recommendations.isEmpty()) {
+      sectionTitle("你可能喜欢");
+      grid(
+          recommendations,
+          s -> s.optString("name"),
+          s -> s.optString("year"),
+          s -> s.optString("poster"),
+          s -> push(() -> discoverDetail(s)));
+    }
+  }
+
+  private static String names(Object value, String key) {
+    List<String> out = new ArrayList<>();
+    JSONArray array = Json.array(value);
+    for (int index = 0; index < array.length(); index++) {
+      Object item = array.opt(index);
+      String name = item instanceof JSONObject ? ((JSONObject) item).optString(key) : String.valueOf(item);
+      if (!name.trim().isEmpty() && !name.equals("null")) out.add(name.trim());
+    }
+    return String.join(" / ", out);
   }
 
   private void music(String provider, String query, int pg) {
-    int token = page("音乐", () -> music(provider, query, pg));
+    int token =
+        page(
+            "music",
+            "音乐",
+            Json.obj("provider", provider, "query", query, "page", pg),
+            () -> music(provider, query, pg));
+    LinearLayout radios = actions();
+    spaced(radios, button(this, "♫ ItaloDance 电台", () -> RadioActivity.open(this)), 10);
     LinearLayout platforms = actions();
     String[][] options = {
-      {"netease", "网易云音乐"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"}, {"kugou", "酷狗音乐"}
+      {"netease", "网易云音乐"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"},
+      {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}
     };
     for (String[] p : options)
       spaced(
           platforms,
           button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1)),
           10);
+    String musicQuality = MusicResolver.normalizeQuality(repo.settings.getString("musicQuality", MusicResolver.HIGH));
+    String qualityLabel = musicQuality.equals(MusicResolver.FLAC) ? "FLAC 无损" : musicQuality + " kbps";
+    spaced(
+        platforms,
+        button(
+            this,
+            "音质：" + qualityLabel,
+            () ->
+                new AlertDialog.Builder(this)
+                    .setTitle("音乐音质")
+                    .setItems(
+                        new String[] {"FLAC 无损", "320 kbps", "128 kbps"},
+                        (dialog, selected) -> {
+                          String quality = selected == 0 ? MusicResolver.FLAC : selected == 1 ? MusicResolver.HIGH : MusicResolver.STANDARD;
+                          repo.settings.edit().putString("musicQuality", quality).apply();
+                          music(provider, query, pg);
+                        })
+                    .setNegativeButton("取消", null)
+                    .show()),
+        10);
     LinearLayout row = horizontal(this);
     EditText input = edit("搜索歌曲、歌手、专辑", query);
     row.addView(input, new LinearLayout.LayoutParams(0, dp(this, 52), 1));
@@ -1346,7 +1725,7 @@ public final class MainActivity extends Activity {
             recent,
             s -> s.optString("name"),
             s -> s.optString("artist"),
-            s -> PlayerActivity.open(this, s),
+            s -> resume(s),
             null);
       } else empty("♫", "让音乐充满客厅", "搜索你喜欢的歌曲，选择一个音源开始播放。", null, null);
       return;
@@ -1369,7 +1748,7 @@ public final class MainActivity extends Activity {
                 toast("正在准备音源…");
                 async(
                     generation,
-                    () -> new MusicClient().play(song),
+                    () -> new MusicClient().play(song, repo.settings.getString("musicQuality", MusicResolver.HIGH)),
                     play -> PlayerActivity.open(this, play));
               },
               song -> {
@@ -1380,315 +1759,11 @@ public final class MainActivity extends Activity {
         });
   }
 
-  private void cloud() {
-    page("云端文件", this::cloud);
-    LinearLayout row = actions();
-    spaced(row, button(this, "＋  添加服务器", this::serverDialog), 12);
-    List<JSONObject> servers = Json.objects(repo.list("servers"));
-    if (servers.isEmpty()) {
-      empty(
-          "▱",
-          "你的媒体，触手可及",
-          "连接 AList、OpenList、Emby、Jellyfin 或 WebDAV，直接浏览和播放服务器上的内容。",
-          "添加服务器",
-          this::serverDialog);
-      return;
-    }
-    tiles(
-        servers,
-        s -> s.optString("name"),
-        s -> s.optString("kind"),
-        s -> push(() -> cloudFolder(s, s.optString("root", "/"))),
-        s ->
-            new AlertDialog.Builder(this)
-                .setTitle(s.optString("name"))
-                .setItems(
-                    new String[] {"编辑", "移除"},
-                    (d, i) -> {
-                      if (i == 1) {
-                        repo.remove("servers", s.optString("id"));
-                        cloud();
-                      } else serverDialog(s);
-                    })
-                .show());
-  }
-
-  private void serverDialog() {
-    serverDialog(new JSONObject());
-  }
-
-  private void serverDialog(JSONObject old) {
-    String[] kinds = {"alist", "emby", "webdav"},
-        labels = {"AList / OpenList", "Emby / Jellyfin", "WebDAV"};
-    LinearLayout form = vertical(this);
-    pad(form, 24, 12);
-    Spinner kind = new Spinner(this);
-    kind.setAdapter(
-        new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
-    kind.setSelection(Math.max(0, Arrays.asList(kinds).indexOf(old.optString("kind", "alist"))));
-    form.addView(kind);
-    EditText name = edit("服务器名称", old.optString("name")),
-        url = edit("服务器地址，例如 http://192.168.1.2:5244", old.optString("address")),
-        user = edit("用户名（匿名访问可留空）", old.optString("username")),
-        pass = edit("密码", old.optString("password")),
-        path = edit("起始目录", old.optString("root", "/"));
-    pass.setInputType(129);
-    for (EditText f : List.of(name, url, user, pass, path)) form.addView(f);
-    AlertDialog dialog =
-        new AlertDialog.Builder(this)
-            .setTitle("媒体服务器")
-            .setView(form)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("连接", null)
-            .create();
-    dialog.setOnShowListener(
-        x ->
-            dialog
-                .getButton(-1)
-                .setOnClickListener(
-                    v -> {
-                      try {
-                        String address =
-                            ConfigCodec.address(url.getText().toString(), null)
-                                .replaceAll("/+$", "");
-                        JSONObject server =
-                            Json.obj(
-                                "id",
-                                old.optString("id", UUID.randomUUID().toString()),
-                                "name",
-                                name.getText().toString().isEmpty()
-                                    ? Uri.parse(address).getHost()
-                                    : name.getText().toString(),
-                                "address",
-                                address,
-                                "kind",
-                                kinds[kind.getSelectedItemPosition()],
-                                "username",
-                                user.getText().toString(),
-                                "password",
-                                pass.getText().toString(),
-                                "root",
-                                path.getText().toString().isEmpty()
-                                    ? "/"
-                                    : path.getText().toString());
-                        toast("正在连接…");
-                        async(
-                            generation,
-                            () -> {
-                              app.cloud.list(server, server.optString("root"));
-                              repo.upsert("servers", server, "id", false, 100);
-                              return server;
-                            },
-                            s -> {
-                              dialog.dismiss();
-                              cloud();
-                            });
-                      } catch (Exception e) {
-                        url.setError(Json.message(e));
-                      }
-                    }));
-    dialog.show();
-  }
-
-  private void cloudFolder(JSONObject server, String path) {
-    int token = page(server.optString("name"), () -> cloudFolder(server, path));
-    body.addView(text(this, path, 14, SECONDARY));
-    gap(body, 18);
-    loading();
-    async(
-        token,
-        () -> app.cloud.list(server, path),
-        files -> {
-          loaded();
-          if (files.isEmpty()) {
-            empty("▱", "这个目录是空的", "选择其他目录，或向服务器添加媒体文件。", null, null);
-            return;
-          }
-          tiles(
-              files,
-              s -> (s.optBoolean("folder") ? "▱  " : "▶  ") + s.optString("name"),
-              s ->
-                  s.optBoolean("folder")
-                      ? "文件夹"
-                      : s.optLong("size") > 0
-                          ? String.format(Locale.ROOT, "%.1f MB", s.optLong("size") / 1048576.0)
-                          : "媒体文件",
-              file -> {
-                if (file.optBoolean("folder"))
-                  push(() -> cloudFolder(server, file.optString("id")));
-                else
-                  async(
-                      generation,
-                      () -> app.cloud.stream(server, file),
-                      play -> PlayerActivity.open(this, play));
-              },
-              null);
-        });
-  }
-
-  private void manga() {
-    page("漫画", this::manga);
-    LinearLayout row = actions();
-    spaced(
-        row,
-        button(
-            this,
-            "＋  添加漫画源",
-            () ->
-                input(
-                    "添加漫画源",
-                    "Venera JavaScript 源地址",
-                    "",
-                    url -> {
-                      toast("正在安装漫画源…");
-                      async(
-                          generation,
-                          () -> app.manga.install(ConfigCodec.address(url, null)),
-                          info -> {
-                            toast("已添加 " + info.optString("name"));
-                            manga();
-                          });
-                    })),
-        12);
-    List<JSONObject> sources = Json.objects(repo.list("mangaSources"));
-    if (sources.isEmpty()) {
-      empty(
-          "▤",
-          "把喜欢的故事带到大屏",
-          "添加 Venera 漫画源，浏览、搜索并阅读漫画。",
-          "添加漫画源",
-          () ->
-              input(
-                  "添加漫画源",
-                  "JavaScript 源地址",
-                  "",
-                  url ->
-                      async(
-                          generation,
-                          () -> app.manga.install(ConfigCodec.address(url, null)),
-                          info -> manga())));
-      return;
-    }
-    tiles(
-        sources,
-        s -> s.optString("name"),
-        s -> "浏览漫画",
-        s -> push(() -> mangaSource(s, 0, 1, "")),
-        s ->
-            new AlertDialog.Builder(this)
-                .setTitle("移除 " + s.optString("name") + "？")
-                .setPositiveButton(
-                    "移除",
-                    (d, i) -> {
-                      repo.remove("mangaSources", s.optString("id"));
-                      manga();
-                    })
-                .setNegativeButton("取消", null)
-                .show());
-  }
-
-  private void mangaSource(JSONObject source, int explore, int pg, String query) {
-    int token = page(source.optString("name"), () -> mangaSource(source, explore, pg, query));
-    JSONObject info = Json.child(source, "info");
-    LinearLayout row = actions();
-    for (int i = 0; i < Json.array(info.opt("explore")).length(); i++) {
-      final int index = i;
-      JSONObject page = Json.array(info.opt("explore")).optJSONObject(i);
-      if (page != null)
-        spaced(
-            row,
-            button(this, page.optString("title"), () -> mangaSource(source, index, 1, "")),
-            10);
-    }
-    spaced(
-        row,
-        button(
-            this, "搜索", () -> input("搜索漫画", "关键词", query, q -> mangaSource(source, explore, 1, q))),
-        10);
-    loading();
-    async(
-        token,
-        () -> {
-          String method;
-          JSONArray args = new JSONArray();
-          if (query.isEmpty()) {
-            method = "explore." + explore + ".load";
-            args.put(pg);
-          } else {
-            method = "search.load";
-            args.put(query).put(new JSONArray()).put(pg);
-          }
-          Object answer = app.manga.call(source.optString("id"), method, args);
-          return answer instanceof JSONObject ? (JSONObject) answer : Json.obj("comics", answer);
-        },
-        answer -> {
-          loaded();
-          List<JSONObject> comics = Json.objects(Json.array(answer.opt("comics")));
-          if (answer.has("data"))
-            for (int i = 0; i < Json.array(answer.opt("data")).length(); i++) {
-              Object part = Json.array(answer.opt("data")).opt(i);
-              if (part instanceof JSONArray) comics.addAll(Json.objects((JSONArray) part));
-              else if (part instanceof JSONObject)
-                comics.addAll(Json.objects(Json.array(((JSONObject) part).opt("comics"))));
-            }
-          if (comics.isEmpty()) empty("▤", "暂无漫画", "选择其他分类或搜索。", null, null);
-          else
-            grid(
-                comics,
-                c -> c.optString("title"),
-                c -> c.optString("subtitle", c.optString("subTitle")),
-                c -> c.optString("cover"),
-                c -> push(() -> mangaDetails(source, c)));
-          pagination(pg, answer.optInt("maxPage", pg), p -> mangaSource(source, explore, p, query));
-        });
-  }
-
-  private void mangaDetails(JSONObject source, JSONObject comic) {
-    int token = page(comic.optString("title"), () -> mangaDetails(source, comic));
-    loading();
-    async(
-        token,
-        () -> app.manga.details(source.optString("id"), comic.optString("id")),
-        details -> {
-          loaded();
-          TextView synopsis =
-              text(this, Catalog.clean(details.optString("description")), 16, SECONDARY);
-          body.addView(synopsis);
-          gap(body, 22);
-          JSONObject chapters = Json.child(details, "chapters");
-          if (chapters.length() == 0) {
-            body.addView(
-                button(this, "开始阅读", () -> ReaderActivity.open(this, source, comic, null)));
-            return;
-          }
-          for (String key : Json.keys(chapters)) {
-            Object value = chapters.opt(key);
-            if (value instanceof JSONObject) {
-              sectionTitle(key);
-              LinearLayout row = actions();
-              for (String id : Json.keys((JSONObject) value))
-                spaced(
-                    row,
-                    button(
-                        this,
-                        ((JSONObject) value).optString(id),
-                        () -> ReaderActivity.open(this, source, comic, id)),
-                    10);
-            } else
-              body.addView(
-                  button(
-                      this,
-                      String.valueOf(value),
-                      () -> ReaderActivity.open(this, source, comic, key)));
-          }
-        });
-  }
-
   private void downloads() {
-    page("下载", this::downloads);
+    page("downloads", "下载", new JSONObject(), this::downloads);
     List<JSONObject> items = Json.objects(repo.list("downloads"));
     if (items.isEmpty()) {
-      empty("↓", "随时离线观看", "在选集页长按确定键下载一集，或从播放器保存当前内容。", "浏览来源", () -> select(6));
+      empty("↓", "随时离线观看", "在选集页长按确定键下载一集，或从播放器保存当前内容。", "浏览点播源", () -> select(5));
       return;
     }
     tiles(
@@ -1724,7 +1799,7 @@ public final class MainActivity extends Activity {
   }
 
   private void settings() {
-    page("设置", this::settings);
+    page("settings", "设置", new JSONObject(), this::settings);
     sectionTitle("订阅");
     LinearLayout row = actions();
     spaced(row, button(this, "＋  添加订阅", this::importDialog), 10);
@@ -1778,7 +1853,7 @@ public final class MainActivity extends Activity {
                                   });
                             else
                               new AlertDialog.Builder(this)
-                                  .setMessage("移除此订阅及其来源？")
+                                  .setMessage("移除此订阅及其点播源？")
                                   .setPositiveButton(
                                       "移除",
                                       (a, b) -> {
@@ -1846,6 +1921,23 @@ public final class MainActivity extends Activity {
         storage,
         button(
             this,
+            "同时下载：" + OfflineService.parallelDownloads() + " 个",
+            () ->
+                new AlertDialog.Builder(this)
+                    .setTitle("同时下载数")
+                    .setItems(
+                        new String[] {"1 个", "2 个", "3 个", "4 个"},
+                        (dialog, selected) -> {
+                          OfflineService.setParallelDownloads(selected + 1);
+                          settings();
+                        })
+                    .setNegativeButton("取消", null)
+                    .show()),
+        10);
+    spaced(
+        storage,
+        button(
+            this,
             "导出备份",
             () ->
                 startActivityForResult(
@@ -1871,13 +1963,13 @@ public final class MainActivity extends Activity {
         storage,
         button(
             this,
-            "恢复隐藏来源",
+            "恢复隐藏点播源",
             () -> {
               SharedPreferences.Editor edit = repo.settings.edit();
               for (String key : repo.settings.getAll().keySet())
                 if (key.startsWith("hidden.")) edit.remove(key);
               edit.apply();
-              toast("已恢复全部来源");
+              toast("已恢复手动隐藏的点播源");
             }),
         10);
     spaced(
@@ -1894,7 +1986,7 @@ public final class MainActivity extends Activity {
     body.addView(
         text(this, "映匣  " + BuildConfig.VERSION_NAME + "  ·  Android TV / ARM32", 18, TEXT));
     gap(body, 8);
-    body.addView(text(this, "所有来源，一方大屏。", 16, SECONDARY));
+    body.addView(text(this, "所有点播源，一方大屏。", 16, SECONDARY));
     gap(body, 12);
     body.addView(text(this, "基于 tvbox-silicon · GPL-3.0\n原版图标、脚本与视觉规范沿用映匣项目。", 14, SECONDARY));
     gap(body, 18);
@@ -1947,6 +2039,15 @@ public final class MainActivity extends Activity {
                                 Http.Result r =
                                     app.http.get(
                                         address, Http.params("User-Agent", "okhttp/3.12.13"));
+                                List<JSONObject> directory = ConfigCodec.directory(r.bytes, r.url);
+                                if (!directory.isEmpty()) {
+                                  runOnUiThread(
+                                      () -> {
+                                        dialog.dismiss();
+                                        chooseDirectory(directory);
+                                      });
+                                  return;
+                                }
                                 repo.importConfig(r.bytes, r.url, name.getText().toString());
                                 app.engine.clear();
                                 runOnUiThread(
@@ -1968,6 +2069,39 @@ public final class MainActivity extends Activity {
                       }
                     }));
     dialog.show();
+  }
+
+  /** A multi-subscription directory is a choice list, not an import error. */
+  private void chooseDirectory(List<JSONObject> entries) {
+    String[] labels = new String[entries.size()];
+    for (int i = 0; i < entries.size(); i++) {
+      String name = entries.get(i).optString("name");
+      labels[i] = name.trim().isEmpty() ? entries.get(i).optString("url") : name;
+    }
+    new AlertDialog.Builder(this)
+        .setTitle("选择订阅")
+        .setItems(
+            labels,
+            (dialog, which) -> {
+              JSONObject entry = entries.get(which);
+              toast("正在读取订阅…");
+              async(
+                  generation,
+                  () -> {
+                    Http.Result r =
+                        app.http.get(
+                            entry.optString("url"),
+                            Http.params("User-Agent", "okhttp/3.12.13"));
+                    repo.importConfig(r.bytes, r.url, entry.optString("name"));
+                    app.engine.clear();
+                    return true;
+                  },
+                  imported -> {
+                    select(0);
+                    toast("订阅已添加");
+                  });
+            })
+        .show();
   }
 
   private void refresh(JSONObject sub) {
@@ -1997,7 +2131,7 @@ public final class MainActivity extends Activity {
     LinearLayout box = vertical(this);
     pad(box, 32, 18);
     box.setGravity(Gravity.CENTER);
-    ImageView qr = new ImageView(this);
+    View qr;
     try {
       com.google.zxing.common.BitMatrix matrix =
           new com.google.zxing.MultiFormatWriter()
@@ -2007,8 +2141,12 @@ public final class MainActivity extends Activity {
       for (int y = 0; y < 320; y++)
         for (int x = 0; x < 320; x++)
           bitmap.setPixel(x, y, matrix.get(x, y) ? Color.BLACK : Color.WHITE);
-      qr.setImageBitmap(bitmap);
-    } catch (Exception ignored) {
+      ImageView image = new ImageView(this);
+      image.setImageBitmap(bitmap);
+      qr = image;
+    } catch (Exception failure) {
+      android.util.Log.e("Yingxia.Main", "Cannot create subscription QR code", failure);
+      qr = text(this, "二维码生成失败，请使用下方地址手动输入。", 16, SECONDARY);
     }
     box.addView(qr, new LinearLayout.LayoutParams(dp(this, 220), dp(this, 220)));
     gap(box, 16);
@@ -2091,24 +2229,30 @@ public final class MainActivity extends Activity {
       return;
     }
     Uri uri = intent.getData();
-    if (uri != null && "yingxia".equals(uri.getScheme())) {
-      String url = uri.getQueryParameter("url");
-      if (url != null)
-        input(
-            "导入订阅",
-            "订阅地址",
-            url,
-            address -> {
-              async(
-                  generation,
-                  () -> {
-                    Http.Result r = app.http.get(ConfigCodec.address(address, null));
-                    repo.importConfig(r.bytes, r.url, null);
-                    return true;
-                  },
-                  x -> select(0));
-            });
+    if (uri == null || !"yingxia".equalsIgnoreCase(uri.getScheme())) return;
+    final JSONObject link;
+    try {
+      link = SubscriptionLink.parse(uri.toString());
+    } catch (Exception error) {
+      android.util.Log.w("Yingxia.Main", "Rejected subscription deep link", error);
+      toast(Json.message(error));
+      return;
     }
+    input(
+        "导入订阅",
+        "订阅地址",
+        link.optString("url"),
+        address -> {
+          async(
+              generation,
+              () -> {
+                Http.Result r = app.http.get(ConfigCodec.address(address, null));
+                repo.importConfig(r.bytes, r.url, link.optString("name", null));
+                app.engine.clear();
+                return true;
+              },
+              x -> select(0));
+        });
   }
 
   private EditText edit(String hint, String value) {
@@ -2173,11 +2317,100 @@ public final class MainActivity extends Activity {
     return String.format(Locale.ROOT, "%d:%02d", ms / 60000, (ms / 1000) % 60);
   }
 
+  private static boolean needsSnapshotData(String route) {
+    return List.of(
+            "site", "sourceSearch", "details", "channels", "discover", "discoverDetail")
+        .contains(route);
+  }
+
+  private void restore(NavigationSnapshot snapshot) {
+    if (snapshot.data() == null && needsSnapshotData(snapshot.route())) {
+      page(
+          "incomplete",
+          snapshot.title(),
+          snapshot.arguments(),
+          () -> restore(snapshot));
+      empty(
+          "◷",
+          "页面尚未加载完成",
+          "没有可恢复的页面数据。可明确重新加载，或继续返回。",
+          "重新加载",
+          () -> openSnapshot(snapshot));
+      return;
+    }
+    restoringSnapshot = true;
+    openSnapshot(snapshot);
+    int y = snapshot.scrollY();
+    scroll.post(
+        () -> {
+          scroll.scrollTo(0, y);
+          restoringSnapshot = false;
+        });
+  }
+
+  @SuppressWarnings("unchecked")
+  private void openSnapshot(NavigationSnapshot snapshot) {
+    JSONObject a = snapshot.arguments();
+    Object data = snapshot.data();
+    switch (snapshot.route()) {
+      case "home":
+        home((JSONObject) data);
+        break;
+      case "sources":
+        sources();
+        break;
+      case "site":
+        site(
+            Json.child(a, "source"),
+            a.optString("category"),
+            a.optInt("page", 1),
+            Json.child(a, "filters"),
+            (CatalogPages) data);
+        break;
+      case "sourceSearch":
+        sourceSearch(
+            Json.child(a, "site"), a.optString("query"), a.optInt("page", 1), (CatalogPages) data);
+        break;
+      case "details":
+        details(Json.child(a, "site"), Json.child(a, "listed"), (JSONObject) data);
+        break;
+      case "library":
+        library(a.optString("key"), a.optString("title"));
+        break;
+      case "live":
+        live();
+        break;
+      case "channels":
+        channels(Json.child(a, "source"), a.optString("selected"), (ChannelLoad) data);
+        break;
+      case "search":
+        searchPage(a.optString("initial"), (SearchSnapshot) data);
+        break;
+      case "discover":
+        discover(a.optString("feed"), a.optInt("page", 1), (JSONObject) data);
+        break;
+      case "discoverDetail":
+        discoverDetail(Json.child(a, "item"), (JSONObject) data);
+        break;
+      case "music":
+        music(a.optString("provider"), a.optString("query"), a.optInt("page", 1));
+        break;
+      case "downloads":
+        downloads();
+        break;
+      case "settings":
+        settings();
+        break;
+      default:
+        throw new IllegalArgumentException("未知页面快照: " + snapshot.route());
+    }
+  }
+
   @Override
   public void onBackPressed() {
-    if (!back.isEmpty()) {
-      Runnable go = back.pop();
-      go.run();
+    NavigationSnapshot previous = back.pop();
+    if (previous != null) {
+      restore(previous);
       return;
     }
     if (!expanded) {

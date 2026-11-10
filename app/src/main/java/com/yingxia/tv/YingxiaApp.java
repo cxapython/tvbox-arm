@@ -9,8 +9,6 @@ public final class YingxiaApp extends Application {
   public Http http;
   public Repository repository;
   public SpiderEngine engine;
-  public MangaEngine manga;
-  public CloudClient cloud;
   public final ExecutorService io =
       Executors.newFixedThreadPool(4, r -> new Thread(r, "yingxia-io"));
 
@@ -25,7 +23,5 @@ public final class YingxiaApp extends Application {
     http = new Http(this);
     repository = new Repository(this);
     engine = new SpiderEngine(this);
-    manga = new MangaEngine(this);
-    cloud = new CloudClient(this);
   }
 }

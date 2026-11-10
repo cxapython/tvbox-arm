@@ -61,6 +61,95 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
         "中文😀");
   }
 
+  public void testPlaybackSourceHeadersReachTheServer() throws Exception {
+    for (String key : new String[] {"User-Agent", "user-agent", "USER-AGENT"}) {
+      androidx.media3.datasource.DataSource data = PlaybackHttp.factory(
+          Map.of(key, "Lavf/57.83.100", "Referer", "http://WJiZxLXA2.com/")).createDataSource();
+      JSONObject received = requestHeaders(data, Collections.emptyMap());
+      assertEquals("Lavf/57.83.100", received.getString("user-agent"));
+      assertEquals("http://WJiZxLXA2.com/", received.getString("referer"));
+    }
+    androidx.media3.datasource.DataSource data = PlaybackHttp.factory(Collections.emptyMap()).createDataSource();
+    assertEquals(Http.UA, requestHeaders(data, Collections.emptyMap()).getString("user-agent"));
+    // Offline requests supply source headers on each DataSpec, including HLS child requests.
+    assertEquals("Lavf/57.83.100", requestHeaders(data,
+        PlaybackHttp.headers(Map.of("user-agent", "Lavf/57.83.100"))).getString("user-agent"));
+  }
+
+  public void testUnsupportedSourcesAreHiddenWithoutDeletingUserData() throws Exception {
+    JSONArray sites = new JSONArray()
+        .put(Json.obj("key", "visible-guazi", "type", 3, "api", "csp_AppgzGuard"))
+        .put(Json.obj("key", "deferred-cz", "type", 3, "api", "csp_NewCzGuard"))
+        .put(Json.obj("key", "deferred-hm", "type", 3, "api", "csp_HmysGuard"))
+        .put(Json.obj("key", "deferred-libvio", "type", 3, "api", "csp_LibvioGuard"))
+        .put(Json.obj("key", "deferred-python", "type", 3, "api", "./source.py"))
+        .put(Json.obj("key", "visible-api", "type", 1, "api", server.base() + "/api"));
+    String origin = server.base() + "/visibility.json";
+    app.repository.importConfig(Json.obj("sites", sites).toString().getBytes(StandardCharsets.UTF_8), origin, "visibility");
+    Set<String> shown = new HashSet<>();
+    for (JSONObject site : app.repository.sites())
+      if (origin.equals(site.optString("origin"))) shown.add(site.optString("key"));
+    assertEquals(Set.of("visible-guazi", "visible-api"), shown);
+    JSONObject stored = null;
+    for (JSONObject sub : app.repository.subscriptions())
+      if (origin.equals(sub.optString("origin"))) stored = sub;
+    assertNotNull(stored);
+    assertEquals(6, stored.getJSONObject("config").getJSONArray("sites").length());
+    JSONArray history = new JSONArray()
+        .put(Json.obj("id", "hidden-history", "site", sites.getJSONObject(1)))
+        .put(Json.obj("id", "visible-history", "site", sites.getJSONObject(0)));
+    app.repository.save("history", history);
+    assertEquals(1, app.repository.visibleLibrary("history").size());
+    assertEquals("visible-history", app.repository.visibleLibrary("history").get(0).getString("id"));
+    assertEquals(2, app.repository.list("history").length());
+    Repository reloaded = new Repository(getActivity());
+    assertEquals(1, reloaded.visibleLibrary("history").size());
+    assertEquals(2, reloaded.list("history").length());
+    assertTrue(reloaded.deferredSites().stream().anyMatch(s -> "deferred-cz".equals(s.optString("key"))));
+  }
+
+  public void testDefaultSubscriptionSeedsOnlyANewLibrary() throws Exception {
+    File directory = new File(getActivity().getCacheDir(), "fresh-library-" + UUID.randomUUID());
+    assertTrue(directory.mkdirs());
+    Context isolated = new ContextWrapper(getActivity()) {
+      @Override public File getFilesDir() { return directory; }
+    };
+    try {
+      Repository fresh = new Repository(isolated);
+      assertEquals(1, fresh.subscriptions().size());
+      assertEquals(Repository.DEFAULT_SUBSCRIPTION, fresh.subscriptions().get(0).getString("origin"));
+      Set<String> keys = new HashSet<>();
+      for (JSONObject site : fresh.sites()) keys.add(site.optString("key"));
+      assertTrue(keys.containsAll(Set.of("光影", "瓜子", "比特")));
+      assertFalse(keys.contains("厂长"));
+      assertFalse(keys.contains("海绵"));
+      assertFalse(keys.contains("立播"));
+      fresh.remove("subscriptions", fresh.subscriptions().get(0).getString("id"));
+      assertTrue(new Repository(isolated).subscriptions().isEmpty());
+      fresh.importConfig(server.config().getBytes(StandardCharsets.UTF_8), server.base() + "/own.json", "own");
+      Repository reopened = new Repository(isolated);
+      assertEquals(1, reopened.subscriptions().size());
+      assertEquals("own", reopened.subscriptions().get(0).getString("name"));
+    } finally {
+      File[] files = directory.listFiles();
+      if (files != null) for (File item : files) assertTrue(item.delete());
+      assertTrue(directory.delete());
+    }
+  }
+
+  private JSONObject requestHeaders(androidx.media3.datasource.DataSource data,
+      Map<String, String> headers) throws Exception {
+    try {
+      data.open(new androidx.media3.datasource.DataSpec.Builder()
+          .setUri(server.base() + "/headers").setHttpRequestHeaders(headers).build());
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      byte[] buffer = new byte[1024];
+      int count;
+      while ((count = data.read(buffer, 0, buffer.length)) != -1) out.write(buffer, 0, count);
+      return new JSONObject(out.toString("UTF-8"));
+    } finally { data.close(); }
+  }
+
   public void testQuickJSUsesOriginalPreludeAndCrossThreadCalls() throws Exception {
     try (ScriptRuntime runtime =
         new ScriptRuntime(getActivity(), "integration", server.base() + "/config.json")) {
@@ -121,21 +210,6 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
     JSONObject play = app.engine.playback(site, v, Catalog.episodes(v).get(0));
     assertEquals(server.base() + "/playback.mp4", play.getString("url"));
     assertEquals("山海之间", play.getString("name"));
-  }
-
-  public void testVeneraSourceExploreDetailsAndPages() throws Exception {
-    JSONObject info = app.manga.install(server.base() + "/comic.js");
-    assertEquals("integration_comic", info.getString("key"));
-    JSONObject result =
-        (JSONObject) app.manga.call("integration_comic", "explore.0.load", new JSONArray().put(1));
-    assertEquals(1, result.getJSONArray("comics").length());
-    assertEquals(
-        "章节一",
-        app.manga
-            .details("integration_comic", "comic1")
-            .getJSONObject("chapters")
-            .getString("ep1"));
-    assertEquals(1, app.manga.pages("integration_comic", "comic1", "ep1").length());
   }
 
   public void testDexPluginSDKAndLoopbackProxy() throws Exception {
@@ -200,8 +274,15 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
               .createDataSource();
       try (InputStream expected =
           getInstrumentation().getContext().getAssets().open("playback.mp4")) {
+        androidx.media3.common.MediaItem media =
+            OfflineService.playbackItem(getActivity(), Json.copy(item).put("complete", true));
+        assertNotNull(media.localConfiguration);
+        assertEquals(id, media.localConfiguration.customCacheKey);
         cached.open(
-            new androidx.media3.datasource.DataSpec(android.net.Uri.parse(item.getString("url"))));
+            new androidx.media3.datasource.DataSpec.Builder()
+                .setUri(media.localConfiguration.uri)
+                .setKey(media.localConfiguration.customCacheKey)
+                .build());
         ByteArrayOutputStream actual = new ByteArrayOutputStream();
         byte[] bytes = new byte[8192];
         int count;
@@ -327,13 +408,13 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
         .runOnMainSync(
             () -> {
               View root = getActivity().getWindow().getDecorView();
-              View v = find(root, "来源");
+              View v = find(root, "点播源");
               assertNotNull(v);
               v.requestFocus();
               v.performClick();
             });
     getInstrumentation().waitForIdleSync();
-    for (String name : List.of("直播", "音乐", "漫画", "收藏", "播放历史", "下载", "设置")) {
+    for (String name : List.of("直播", "音乐", "收藏", "播放历史", "下载", "设置")) {
       getInstrumentation()
           .runOnMainSync(
               () -> {
@@ -442,8 +523,15 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
         String first = r.readLine();
         if (first == null) return;
         String path = first.split(" ")[1];
+        JSONObject requestHeaders = new JSONObject();
+        for (String line; (line = r.readLine()) != null && !line.isEmpty();) {
+          int colon = line.indexOf(':');
+          if (colon > 0) requestHeaders.put(line.substring(0, colon).toLowerCase(Locale.ROOT),
+              line.substring(colon + 1).trim());
+        }
         String body = "{}", type = "application/json";
-        if (path.startsWith("/config")) body = config();
+        if (path.startsWith("/headers")) body = requestHeaders.toString();
+        else if (path.startsWith("/config")) body = config();
         else if (path.startsWith("/api")) {
           JSONArray list = new JSONArray();
           if (path.contains("ids=")) list.put(video(1));
@@ -470,13 +558,7 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
                   + " TextDecoder('gbk').decode(new Uint8Array([196,227,186,195])),link:pd('<a"
                   + " href=\"/1\">x</a>','a&&href','https://example.com/list/')}}},category(){return"
                   + " {list:[]}},search(){return {list:[]}}};";
-        } else if (path.startsWith("/comic.js")) {
-          type = "text/javascript";
-          body =
-              "class IntegrationComic extends ComicSource"
-                  + " {name='测试漫画';key='integration_comic';version='1.0';url='https://example.com';explore=[{title:'推荐',type:'multiPageComicList',load:async"
-                  + " page=>({comics:[{id:'comic1',title:'漫画一',cover:''}],maxPage:1})}];comic={loadInfo:async"
-                  + " id=>({title:'漫画一',chapters:{ep1:'章节一'},description:'测试'}),loadEp:async(id,ep)=>({images:['https://example.com/page.jpg']})};}";
+
         }
         byte[] data = body.getBytes(StandardCharsets.UTF_8);
         if (path.startsWith("/spider-fixture.jar") || path.startsWith("/playback.mp4")) {

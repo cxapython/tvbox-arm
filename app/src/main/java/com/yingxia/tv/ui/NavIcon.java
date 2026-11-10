@@ -47,32 +47,19 @@ final class NavIcon extends Drawable {
         c.drawOval(14, 14, 20, 19, paint);
         break;
       case 4:
-        path(c, 12, 6, 12, 21);
-        path(c, 12, 6, 8, 4, 2, 4, 2, 18, 8, 18, 12, 21, 16, 18, 22, 18, 22, 4, 16, 4, 12, 6);
-        break;
-      case 5:
         c.drawCircle(10, 10, 7, paint);
         path(c, 15, 15, 22, 22);
         break;
-      case 6:
+      case 5:
         for (int y = 3; y <= 14; y += 11)
           for (int x = 3; x <= 14; x += 11) c.drawRoundRect(x, y, x + 7, y + 7, 1.5f, 1.5f, paint);
         break;
-      case 7:
-        Path cloud = new Path();
-        cloud.moveTo(6, 19);
-        cloud.cubicTo(-1, 19, 0, 9, 7, 10);
-        cloud.cubicTo(7, 0, 21, 1, 20, 11);
-        cloud.cubicTo(26, 12, 23, 19, 19, 19);
-        cloud.close();
-        c.drawPath(cloud, paint);
-        break;
-      case 8:
+      case 6:
         c.drawArc(3, 3, 21, 21, -150, 300, false, paint);
         path(c, 2, 3, 2, 9, 8, 9);
         path(c, 12, 7, 12, 12, 16, 14);
         break;
-      case 9:
+      case 7:
         Path heart = new Path();
         heart.moveTo(12, 21);
         heart.cubicTo(8, 17, 1, 12, 2, 7);
@@ -81,12 +68,12 @@ final class NavIcon extends Drawable {
         heart.cubicTo(23, 12, 16, 17, 12, 21);
         c.drawPath(heart, paint);
         break;
-      case 10:
+      case 8:
         path(c, 12, 2, 12, 16);
         path(c, 6, 10, 12, 16, 18, 10);
         path(c, 3, 17, 3, 22, 21, 22, 21, 17);
         break;
-      case 11:
+      case 9:
         for (int y = 5; y <= 19; y += 7) {
           path(c, 2, y, 22, y);
           float x = y == 12 ? 15 : 8;

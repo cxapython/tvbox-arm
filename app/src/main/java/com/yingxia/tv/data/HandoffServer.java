@@ -105,15 +105,28 @@ public final class HandoffServer implements AutoCloseable {
           new NsdManager.RegistrationListener() {
             public void onServiceRegistered(NsdServiceInfo i) {}
 
-            public void onRegistrationFailed(NsdServiceInfo i, int e) {}
+            public void onRegistrationFailed(NsdServiceInfo i, int e) {
+              nsdRegistrationFailed("NSD 注册失败，错误码 " + e, null);
+            }
 
             public void onServiceUnregistered(NsdServiceInfo i) {}
 
             public void onUnregistrationFailed(NsdServiceInfo i, int e) {}
           };
       nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registration);
-    } catch (Exception ignored) {
+    } catch (Exception error) {
+      nsdRegistrationFailed("NSD 注册失败：" + Json.message(error), error);
     }
+  }
+
+  private void nsdRegistrationFailed(String message, Exception error) {
+    if (error == null) android.util.Log.e("Yingxia.Handoff", message);
+    else android.util.Log.e("Yingxia.Handoff", message, error);
+    activity.runOnUiThread(
+        () ->
+            android.widget.Toast
+                .makeText(activity, "手机输入服务注册失败，请检查局域网权限。" + message, android.widget.Toast.LENGTH_LONG)
+                .show());
   }
 
   private void serve(Socket socket) {

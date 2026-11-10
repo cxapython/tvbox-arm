@@ -31,8 +31,14 @@ public final class PlayerActivity extends Activity {
   private final Handler handler = new Handler(Looper.getMainLooper());
   private long resume = 0;
   private TextView title, subtitle;
+  private MusicLyrics lyrics;
   private boolean seekingNext = false, released = false;
   private boolean resumeWhenForeground;
+  private boolean recoveryScheduled, progressErrorShown;
+  private int operationGeneration;
+  private Runnable retry;
+  private PlaybackRecovery recovery = new PlaybackRecovery();
+  private EpisodeSkip.Pass skipPass = new EpisodeSkip.Pass(java.util.Collections.emptyList());
 
   public static void open(Context context, JSONObject play) {
     try {
@@ -63,6 +69,8 @@ public final class PlayerActivity extends Activity {
       }
       file.delete();
     } catch (Exception e) {
+      android.util.Log.e("Yingxia.Player", "Cannot read playback request", e);
+      Toast.makeText(this, "无法读取播放信息：" + Json.message(e), Toast.LENGTH_LONG).show();
       finish();
       return;
     }
@@ -101,6 +109,7 @@ public final class PlayerActivity extends Activity {
     spaced(actions, button(this, "返回", this::finish), 8);
     spaced(actions, button(this, "选集", this::episodes), 8);
     spaced(actions, button(this, "音轨 / 字幕", this::tracks), 8);
+    spaced(actions, button(this, "清晰度", this::qualities), 8);
     spaced(actions, button(this, "倍速", this::speed), 8);
     spaced(actions, button(this, "画面", this::aspect), 8);
     spaced(
@@ -126,6 +135,8 @@ public final class PlayerActivity extends Activity {
     if (play.optBoolean("music")) {
       ImageView cover = new ImageView(this);
       cover.setScaleType(ImageView.ScaleType.FIT_CENTER);
+      cover.setBackground(monogram(this, play.optString("name", "♫")));
+      subtitle.setMaxLines(8);
       FrameLayout.LayoutParams cp =
           new FrameLayout.LayoutParams(dp(this, 250), dp(this, 250), Gravity.CENTER);
       root.addView(cover, 1, cp);
@@ -135,17 +146,51 @@ public final class PlayerActivity extends Activity {
           .execute(
               () -> {
                 try {
-                  String lyrics = new MusicClient().lyrics(play);
+                  MusicLyrics parsed = MusicLyrics.parse(new MusicClient().lyrics(play));
                   runOnUiThread(
-                      () ->
-                          subtitle.setText(
-                              play.optString("artist")
-                                  + " · "
-                                  + lyrics.replaceAll("\\[[^]]*]", "").trim().split("\n")[0]));
-                } catch (Exception ignored) {
+                      () -> {
+                        if (isFinishing()) return;
+                        lyrics = parsed;
+                        if (lyrics == null)
+                          subtitle.setText(play.optString("artist") + " · 暂无歌词");
+                        else updateLyrics();
+                      });
+                } catch (Exception error) {
+                  android.util.Log.w("Yingxia.Player", "Cannot load lyrics", error);
+                  runOnUiThread(
+                      () -> {
+                        if (!isFinishing()) subtitle.setText(play.optString("artist") + " · 歌词加载失败");
+                      });
                 }
               });
     }
+  }
+
+  private void updateLyrics() {
+    if (!play.optBoolean("music") || lyrics == null || subtitle == null) return;
+    String artist = play.optString("artist");
+    if (!lyrics.synced) {
+      List<String> all = new ArrayList<>();
+      for (MusicLyrics.Line line : lyrics.lines) {
+        all.add(line.text);
+        if (line.translation != null && !line.translation.isEmpty()) all.add(line.translation);
+      }
+      subtitle.setText(artist + "\n" + String.join("\n", all));
+      return;
+    }
+    int index = lyrics.indexAt(player == null ? resume : player.getCurrentPosition());
+    if (index < 0) {
+      subtitle.setText(artist + " · ♪");
+      return;
+    }
+    MusicLyrics.Line line = lyrics.lines.get(index);
+    subtitle.setText(
+        artist
+            + "\n"
+            + line.text
+            + (line.translation == null || line.translation.isEmpty()
+                ? ""
+                : "\n" + line.translation));
   }
 
   private YingxiaApp app() {
@@ -153,19 +198,22 @@ public final class PlayerActivity extends Activity {
   }
 
   private void start() {
-    if (player != null) {
-      view.setPlayer(null);
-      player.release();
-    }
     released = false;
-    DefaultHttpDataSource.Factory network =
-        new DefaultHttpDataSource.Factory()
-            .setUserAgent(Http.UA)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(12000)
-            .setReadTimeoutMs(25000)
-            .setDefaultRequestProperties(Json.headers(play.optJSONObject("header")));
-    DataSource.Factory upstream = new DefaultDataSource.Factory(this, network);
+    recovery = new PlaybackRecovery();
+    operationGeneration++;
+    if (player == null) createPlayer();
+    loadCurrent();
+  }
+
+  /** The ExoPlayer lives for the whole activity; episodes, qualities and refreshed URLs replace only its item. */
+  private void createPlayer() {
+    DataSource.Factory network =
+        () -> PlaybackHttp.factory(Json.headers(play.optJSONObject("header"))).createDataSource();
+    DataSource.Factory upstream =
+        () ->
+            new PlaybackDataSource(
+                new DefaultDataSource.Factory(this, network).createDataSource(),
+                app().repository.settings.getBoolean("player.skipAds", true));
     CacheDataSource.Factory cached =
         new CacheDataSource.Factory()
             .setCache(OfflineService.cache(this))
@@ -197,19 +245,9 @@ public final class PlayerActivity extends Activity {
     player.addListener(
         new Player.Listener() {
           @Override
-          public void onPlayerError(PlaybackException e) {
-            new AlertDialog.Builder(PlayerActivity.this)
-                .setTitle("暂时无法播放")
-                .setMessage(e.getErrorCodeName() + "\n请重试，或选择其他线路。")
-                .setPositiveButton(
-                    "重试",
-                    (d, i) -> {
-                      resume = player.getCurrentPosition();
-                      start();
-                    })
-                .setNeutralButton("选集", (d, i) -> episodes())
-                .setNegativeButton("返回", (d, i) -> finish())
-                .show();
+          public void onPlayerError(PlaybackException error) {
+            long position = player == null ? resume : Math.max(0, player.getCurrentPosition());
+            scheduleRecovery(error, position);
           }
 
           @Override
@@ -217,10 +255,12 @@ public final class PlayerActivity extends Activity {
             if (state == Player.STATE_ENDED && !seekingNext) next();
           }
         });
+  }
+
+  private void loadCurrent() {
     try {
       MediaItem.Builder item =
-          new MediaItem.Builder()
-              .setUri(play.getString("url"))
+          OfflineService.playbackItem(this, play).buildUpon()
               .setMediaMetadata(
                   new MediaMetadata.Builder()
                       .setTitle(play.optString("name"))
@@ -242,6 +282,11 @@ public final class PlayerActivity extends Activity {
                   .build());
       }
       item.setSubtitleConfigurations(subs);
+      skipPass =
+          new EpisodeSkip.Pass(
+              play.optBoolean("live") || play.optBoolean("music")
+                  ? java.util.Collections.emptyList()
+                  : EpisodeSkip.parse(play.opt("skips")));
       player.setMediaItem(item.build());
       long intro =
           play.optBoolean("live") || play.optBoolean("music")
@@ -251,11 +296,101 @@ public final class PlayerActivity extends Activity {
       player.prepare();
       player.play();
       handler.removeCallbacks(progress);
+      handler.removeCallbacks(sourceSkip);
       handler.postDelayed(progress, 5000);
+      handler.postDelayed(sourceSkip, 250);
     } catch (Exception e) {
-      Toast.makeText(this, Json.message(e), android.widget.Toast.LENGTH_LONG).show();
+      android.util.Log.e("Yingxia.Player", "Cannot load media item", e);
+      Toast.makeText(this, "无法加载播放地址：" + Json.message(e), Toast.LENGTH_LONG).show();
       finish();
     }
+  }
+
+  private static boolean retryable(PlaybackException error) {
+    int code = error.errorCode;
+    return code >= PlaybackException.ERROR_CODE_IO_UNSPECIFIED
+        && code < PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED;
+  }
+
+  /** Every automatic attempt refreshes the catalog address through SpiderEngine.resume first. */
+  private void scheduleRecovery(Exception failure, long position) {
+    if (released || recoveryScheduled || seekingNext || isFinishing()) return;
+    boolean canRetry = !(failure instanceof PlaybackException) || retryable((PlaybackException) failure);
+    PlaybackRecovery.Decision decision = recovery.afterFailure(canRetry, position / 1000.0);
+    if (decision == null) {
+      showPlaybackError(failure, position);
+      return;
+    }
+    recoveryScheduled = true;
+    Toast.makeText(
+            this,
+            "播放中断，" + decision.delayMillis / 1000
+                + (play.optBoolean("music") || Json.child(play, "site").length() > 0
+                    ? " 秒后自动刷新地址并重试（" : " 秒后自动重试（")
+                + recovery.attempts() + "/3）",
+            Toast.LENGTH_SHORT)
+        .show();
+    retry = () -> refreshAddress(position);
+    handler.postDelayed(retry, decision.delayMillis);
+  }
+
+  private void refreshAddress(long position) {
+    final int generation = operationGeneration;
+    app()
+        .io
+        .execute(
+            () -> {
+              try {
+                JSONObject saved = Json.copy(play);
+                saved.put("position", position).put("completed", false);
+                JSONObject refreshed;
+                if (play.optBoolean("music")) {
+                  refreshed = new MusicClient().play(saved);
+                } else if (Json.child(play, "site").length() > 0) {
+                  refreshed = app().engine.resume(saved);
+                } else {
+                  refreshed = saved;
+                }
+                runOnUiThread(
+                    () -> {
+                      if (generation != operationGeneration || isFinishing()) return;
+                      play = refreshed;
+                      resume = position;
+                      recoveryScheduled = false;
+                      loadCurrent();
+                    });
+              } catch (Exception error) {
+                android.util.Log.w("Yingxia.Player", "Playback address refresh failed", error);
+                runOnUiThread(
+                    () -> {
+                      if (generation != operationGeneration || isFinishing()) return;
+                      recoveryScheduled = false;
+                      scheduleRecovery(error, position);
+                    });
+              }
+            });
+  }
+
+  private void showPlaybackError(Exception failure, long position) {
+    String reason = failure instanceof PlaybackException
+        ? ((PlaybackException) failure).getErrorCodeName() : Json.message(failure);
+    new AlertDialog.Builder(this)
+        .setTitle("暂时无法播放")
+        .setMessage(reason + "\n请手动重试，或选择其他线路。")
+        .setPositiveButton(
+            "重试",
+            (dialog, which) -> {
+              recovery = new PlaybackRecovery();
+              scheduleRecovery(failure, position);
+            })
+        .setNeutralButton("选集", (dialog, which) -> episodes())
+        .setNegativeButton("返回", (dialog, which) -> finish())
+        .show();
+  }
+
+  private void cancelRecovery() {
+    if (retry != null) handler.removeCallbacks(retry);
+    recoveryScheduled = false;
   }
 
   private final Runnable progress =
@@ -276,11 +411,39 @@ public final class PlayerActivity extends Activity {
         }
       };
 
+  private final Runnable sourceSkip =
+      new Runnable() {
+        @Override
+        public void run() {
+          if (released || player == null) return;
+          long duration = player.getDuration();
+          updateLyrics();
+          Double target =
+              skipPass.target(
+                  player.getCurrentPosition() / 1000.0, duration / 1000.0, player.isPlaying());
+          if (target != null) {
+            if (duration > 0 && target >= duration / 1000.0 - 0.1) {
+              if (!next()) player.seekTo((long) (target * 1000));
+            } else {
+              player.seekTo((long) (target * 1000));
+            }
+          }
+          handler.postDelayed(this, 250);
+        }
+      };
+
   private void save() {
-    if (player != null && !play.optBoolean("live"))
-      app()
-          .repository
-          .progress(play, player.getCurrentPosition(), Math.max(0, player.getDuration()));
+    if (player == null || play.optBoolean("live")) return;
+    try {
+      app().repository.progress(play, player.getCurrentPosition(), Math.max(0, player.getDuration()));
+      progressErrorShown = false;
+    } catch (RuntimeException error) {
+      android.util.Log.e("Yingxia.Player", "Cannot persist playback progress", error);
+      if (!progressErrorShown) {
+        progressErrorShown = true;
+        Toast.makeText(this, "播放进度保存失败：" + Json.message(error), Toast.LENGTH_LONG).show();
+      }
+    }
   }
 
   private void episodes() {
@@ -299,22 +462,21 @@ public final class PlayerActivity extends Activity {
         .show();
   }
 
-  private void next() {
-    if (seekingNext) return;
-    List<JSONObject> episodes = Json.objects(Json.array(play.opt("episodes")));
-    JSONObject current = Json.child(play, "episodeInfo");
-    for (int i = 0; i + 1 < episodes.size(); i++)
-      if (episodes.get(i).optString("id").equals(current.optString("id"))
-          && episodes.get(i + 1).optString("flag").equals(current.optString("flag"))) {
-        switchTo(episodes.get(i + 1));
-        return;
-      }
+  private boolean next() {
+    if (seekingNext) return true;
+    JSONObject episode = EpisodePlaylist.next(play);
+    if (episode == null) return false;
+    switchTo(episode);
+    return true;
   }
 
   private void switchTo(JSONObject episode) {
     if (seekingNext) return;
     save();
+    cancelRecovery();
     seekingNext = true;
+    final int generation = ++operationGeneration;
+    final boolean wasPlaying = player == null || player.getPlayWhenReady();
     if (player != null) player.pause();
     JSONObject site = Json.child(play, "site"), video = Json.child(play, "video");
     app()
@@ -327,21 +489,84 @@ public final class PlayerActivity extends Activity {
                 if (play.optBoolean("live")) result.put("episodes", play.opt("episodes"));
                 runOnUiThread(
                     () -> {
-                      if (isFinishing()) return;
+                      if (generation != operationGeneration || isFinishing()) return;
                       play = result;
                       resume = 0;
-                      seekingNext = false;
+                      recovery = new PlaybackRecovery();
                       title.setText(play.optString("name"));
                       subtitle.setText(play.optString("episode"));
-                      start();
+                      loadCurrent();
+                      seekingNext = false;
                     });
               } catch (Exception e) {
+                android.util.Log.w("Yingxia.Player", "Cannot switch episode", e);
                 runOnUiThread(
                     () -> {
+                      if (generation != operationGeneration || isFinishing()) return;
                       seekingNext = false;
-                      Toast.makeText(this, Json.message(e), android.widget.Toast.LENGTH_LONG)
+                      Toast.makeText(this, Json.message(e), Toast.LENGTH_LONG).show();
+                      if (wasPlaying && player != null) player.play();
+                    });
+              }
+            });
+  }
+
+  private void qualities() {
+    List<JSONObject> qualities = Json.objects(Json.array(play.opt("qualities")));
+    if (qualities.size() <= 1) {
+      Toast.makeText(this, "此线路没有其他清晰度", Toast.LENGTH_SHORT).show();
+      return;
+    }
+    String[] labels = new String[qualities.size()];
+    int selected = play.optInt("quality", 0);
+    for (int index = 0; index < labels.length; index++) {
+      String name = qualities.get(index).optString("name", "清晰度 " + (index + 1));
+      labels[index] = (index == selected ? "● " : "") + name;
+    }
+    new AlertDialog.Builder(this)
+        .setTitle("选择清晰度")
+        .setItems(labels, (dialog, index) -> chooseQuality(index))
+        .setNegativeButton("取消", null)
+        .show();
+  }
+
+  private void chooseQuality(int quality) {
+    if (seekingNext || quality == play.optInt("quality", 0) || player == null) return;
+    save();
+    cancelRecovery();
+    seekingNext = true;
+    final int generation = ++operationGeneration;
+    final long position = player.getCurrentPosition();
+    final boolean wasPlaying = player.getPlayWhenReady();
+    player.pause();
+    JSONObject site = Json.child(play, "site"), video = Json.child(play, "video");
+    JSONObject episode = Json.child(play, "episodeInfo");
+    app()
+        .io
+        .execute(
+            () -> {
+              try {
+                JSONObject result = app().engine.playback(site, video, episode, quality);
+                runOnUiThread(
+                    () -> {
+                      if (generation != operationGeneration || isFinishing()) return;
+                      play = result;
+                      resume = position;
+                      recovery = new PlaybackRecovery();
+                      loadCurrent();
+                      if (!wasPlaying) player.pause();
+                      seekingNext = false;
+                      Toast.makeText(this, "已切换清晰度", Toast.LENGTH_SHORT).show();
+                    });
+              } catch (Exception error) {
+                android.util.Log.w("Yingxia.Player", "Cannot switch quality", error);
+                runOnUiThread(
+                    () -> {
+                      if (generation != operationGeneration || isFinishing()) return;
+                      seekingNext = false;
+                      Toast.makeText(this, "清晰度切换失败：" + Json.message(error), Toast.LENGTH_LONG)
                           .show();
-                      if (player != null) player.play();
+                      if (wasPlaying) player.play();
                     });
               }
             });
@@ -447,7 +672,9 @@ public final class PlayerActivity extends Activity {
     if (player != null && resumeWhenForeground) player.play();
     if (player != null) {
       handler.removeCallbacks(progress);
+      handler.removeCallbacks(sourceSkip);
       handler.postDelayed(progress, 5000);
+      handler.postDelayed(sourceSkip, 250);
     }
   }
 
@@ -456,6 +683,7 @@ public final class PlayerActivity extends Activity {
     super.onStop();
     save();
     handler.removeCallbacks(progress);
+    handler.removeCallbacks(sourceSkip);
     if (player != null) {
       resumeWhenForeground = player.getPlayWhenReady();
       player.pause();
@@ -465,6 +693,8 @@ public final class PlayerActivity extends Activity {
   @Override
   protected void onDestroy() {
     released = true;
+    operationGeneration++;
+    cancelRecovery();
     handler.removeCallbacksAndMessages(null);
     if (player != null) {
       view.setPlayer(null);

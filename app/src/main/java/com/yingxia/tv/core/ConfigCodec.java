@@ -109,8 +109,8 @@ public final class ConfigCodec {
         b.append('\n');
       } else if (c == '/' && n == '*') {
         int end = s.indexOf("*/", i + 2);
-        if (end < 0) throw new IllegalArgumentException("订阅的注释没有结束");
         b.append(' ');
+        if (end < 0) break; // Tolerate an unterminated block comment by dropping the rest.
         i = end + 1;
       } else b.append(c);
     }
@@ -148,10 +148,50 @@ public final class ConfigCodec {
     if (Json.array(config.opt("sites")).length() == 0
         && Json.array(config.opt("lives")).length() == 0) {
       if (config.has("urls") || config.has("storeHouse"))
-        throw new IllegalArgumentException("这是订阅目录，请选择其中一个订阅地址");
+        throw new DirectoryException("这是订阅目录，请选择其中一个订阅地址");
       throw new IllegalArgumentException("没有找到可用的点播源或直播源");
     }
     return config;
+  }
+
+  /** A directory (多仓) of subscriptions: the UI offers the entries of directory() instead. */
+  public static final class DirectoryException extends IllegalArgumentException {
+    public DirectoryException(String message) {
+      super(message);
+    }
+  }
+
+  /**
+   * The subscriptions a directory (多仓) lists: `urls` as [{name, url}], or `storeHouse` as
+   * [{sourceName, sourceUrl}]. An empty list means the document is not a directory. Bad or
+   * duplicate entries are skipped; addresses resolve against the directory's own origin.
+   */
+  public static List<JSONObject> directory(byte[] data, String origin) throws Exception {
+    return directory(decode(data), origin);
+  }
+
+  public static List<JSONObject> directory(JSONObject config, String origin) {
+    List<JSONObject> out = new ArrayList<>();
+    if (config.has("sites") || config.has("lives")) return out;
+    Set<String> seen = new HashSet<>();
+    for (JSONArray array :
+        Arrays.asList(Json.array(config.opt("urls")), Json.array(config.opt("storeHouse"))))
+      for (JSONObject item : Json.objects(array)) {
+        Object value = item.opt("url");
+        if (!(value instanceof String)) value = item.opt("sourceUrl");
+        if (!(value instanceof String) || ((String) value).trim().isEmpty()) continue;
+        String url;
+        try {
+          url = address((String) value, origin);
+        } catch (IllegalArgumentException invalid) {
+          continue; // Skip entries with bad addresses, like the original's compactMap.
+        }
+        if (!seen.add(url)) continue;
+        Object name = item.opt("name");
+        if (!(name instanceof String)) name = item.optString("sourceName");
+        out.add(Json.obj("name", name, "url", url));
+      }
+    return out;
   }
 
   public static String hash(String s) {

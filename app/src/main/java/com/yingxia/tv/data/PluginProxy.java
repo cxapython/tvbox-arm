@@ -21,8 +21,9 @@ public final class PluginProxy {
             try {
               Socket c = server.accept();
               io.execute(() -> serve(c));
-            } catch (IOException ignored) {
-              break;
+            } catch (IOException e) {
+              if (server.isClosed()) return;
+              android.util.Log.w("Yingxia.PluginProxy", "accept failed: " + e.getMessage());
             }
         });
   }
@@ -37,7 +38,8 @@ public final class PluginProxy {
   }
 
   private void serve(Socket socket) {
-    try (Socket client = socket) {
+    try {
+      Socket client = socket;
       client.setSoTimeout(15000);
       BufferedReader reader =
           new BufferedReader(
@@ -86,7 +88,24 @@ public final class PluginProxy {
         while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
       }
       out.flush();
-    } catch (Exception ignored) {
+    } catch (Exception e) {
+      android.util.Log.w(
+          "Yingxia.PluginProxy", "serve failed: " + e.getClass().getSimpleName(), e);
+      try {
+        socket
+            .getOutputStream()
+            .write(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .getBytes(StandardCharsets.US_ASCII));
+      } catch (Exception reply) {
+        android.util.Log.w("Yingxia.PluginProxy", "cannot report proxy error to client", reply);
+      }
+    } finally {
+      try {
+        socket.close();
+      } catch (IOException closeFailure) {
+        android.util.Log.d("Yingxia.PluginProxy", "proxy socket close failed", closeFailure);
+      }
     }
   }
 }

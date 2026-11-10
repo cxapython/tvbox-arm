@@ -31,9 +31,17 @@ public final class Json {
     if (v instanceof String)
       try {
         return new JSONArray((String) v);
-      } catch (Exception ignored) {
+      } catch (Exception parse) {
+        // TVBox treats a string that is no JSON array as an empty list.
+        debug("not a JSON array (" + ((String) v).length() + " characters)");
       }
     return new JSONArray();
+  }
+
+  /** android.util.Log without loading it in host-side unit tests. */
+  private static void debug(String message) {
+    String vm = System.getProperty("java.vm.name", "");
+    if (vm.contains("Dalvik") || vm.contains("ART")) android.util.Log.d("Yingxia.Json", message);
   }
 
   public static JSONObject child(JSONObject o, String k) {

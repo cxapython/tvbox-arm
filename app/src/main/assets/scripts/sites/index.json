@@ -76,11 +76,6 @@
    "sites": "厂长",
    "status": "site behind a SafeLine WAF challenge (fails for the JAR too)"
   },
-  "DJHub": {
-   "script": "DJHub.js",
-   "sites": "短剧聚合",
-   "status": "OK (七猫, 星芽, 西饭, 围观, 河马, 好看)"
-  },
   "DoubaoGuard": {
    "script": "Doubao.js",
    "sites": "多多回放 (fty)",

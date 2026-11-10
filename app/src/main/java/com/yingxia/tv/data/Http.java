@@ -51,6 +51,38 @@ public final class Http {
       boolean redirect,
       int timeout)
       throws IOException {
+    return request(url, method, headers, body, limit, redirect, timeout, null);
+  }
+
+  /**
+   * As {@link #request(String, String, Map, byte[], int, boolean, int)}, also publishing the
+   * in-flight okhttp {@link Call} through {@code callRef} so callers may cancel it best-effort.
+   */
+  public Result request(
+      String url,
+      String method,
+      Map<String, String> headers,
+      byte[] body,
+      int limit,
+      boolean redirect,
+      int timeout,
+      java.util.concurrent.atomic.AtomicReference<Call> callRef)
+      throws IOException {
+    return request(url, method, headers, body, limit, redirect, timeout, callRef, null);
+  }
+
+  /** Also closes the race where cancellation happens just before okhttp creates its Call. */
+  public Result request(
+      String url,
+      String method,
+      Map<String, String> headers,
+      byte[] body,
+      int limit,
+      boolean redirect,
+      int timeout,
+      java.util.concurrent.atomic.AtomicReference<Call> callRef,
+      java.util.function.BooleanSupplier cancelled)
+      throws IOException {
     Request.Builder b = new Request.Builder().url(url).header("User-Agent", UA);
     headers.forEach(b::header);
     if (!method.equals("GET") && !method.equals("HEAD"))
@@ -67,7 +99,10 @@ public final class Http {
             .followSslRedirects(redirect)
             .callTimeout(Math.min(Math.max(timeout, 1000), 120000), TimeUnit.MILLISECONDS)
             .build();
-    try (Response r = use.newCall(b.build()).execute()) {
+    Call call = use.newCall(b.build());
+    if (callRef != null) callRef.set(call);
+    if (cancelled != null && cancelled.getAsBoolean()) call.cancel();
+    try (Response r = call.execute()) {
       Result out = new Result();
       out.url = r.request().url().toString();
       out.status = r.code();

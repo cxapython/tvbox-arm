@@ -17,6 +17,7 @@ import org.xmlpull.v1.*;
 public final class SpiderEngine {
   private final Context context;
   private final Http http;
+  private final LiteFallback liteFallback = new LiteFallback();
   private final Map<String, Spider> jarSpiders = new java.util.concurrent.ConcurrentHashMap<>();
   private final Map<Session, Integer> activeSessions = new java.util.IdentityHashMap<>();
   private final Map<String, Session> sessions = new LinkedHashMap<>(4, .75f, true);
@@ -44,11 +45,9 @@ public final class SpiderEngine {
       activeSessions.put(session, activeSessions.getOrDefault(session, 0) + 1);
     }
     try {
-      synchronized (session) {
-        JSONObject result = session.call(params);
-        if (result.has("error")) throw new IOException(result.optString("error"));
-        return result;
-      }
+      JSONObject result = session.call(params);
+      if (result.has("error")) throw new IOException(result.optString("error"));
+      return result;
     } finally {
       synchronized (sessions) {
         int refs = activeSessions.getOrDefault(session, 1) - 1;
@@ -99,7 +98,11 @@ public final class SpiderEngine {
             mapping instanceof String
                 ? (String) mapping
                 : mapping instanceof JSONObject ? ((JSONObject) mapping).optString("script") : "";
-        if (!mapped.isEmpty()) {
+        String extension = site.optString("ext").trim().toLowerCase(Locale.ROOT);
+        String extensionPath = extension.split("\\?", 2)[0];
+        boolean extIsScript = !extension.startsWith("{")
+            && (extensionPath.endsWith(".js") || extensionPath.endsWith(".py"));
+        if (!mapped.isEmpty() && !extIsScript) {
           JSONObject jarSite = Json.copy(site);
           site.put("api", mapped.startsWith("assets:") ? mapped : "assets://sites/" + mapped);
           Session lightweight;
@@ -112,16 +115,23 @@ public final class SpiderEngine {
           if (jarSite.optString("jar", jarSite.optString("spider")).isEmpty()) return lightweight;
           return new Session() {
             private Session fallback;
+            private final String fallbackKey = jarSite.optString("key", jarSite.optString("id"));
 
             public JSONObject call(JSONObject params) throws Exception {
-              if (fallback != null) return fallback.call(params);
+              if (!liteFallback.prefersPort(fallbackKey)) {
+                if (fallback == null) fallback = jar(jarSite);
+                return fallback.call(params);
+              }
               try {
                 JSONObject answer = lightweight.call(params);
                 if (answer.has("error")) throw new IOException(answer.optString("error"));
+                String unusable = LiteSites.unusable(answer, params);
+                if (unusable != null) throw new IOException(unusable);
                 return answer;
               } catch (Exception original) {
                 try {
-                  fallback = jar(jarSite);
+                  if (fallback == null) fallback = jar(jarSite);
+                  liteFallback.record(fallbackKey);
                   return fallback.call(params);
                 } catch (Exception error) {
                   error.addSuppressed(original);
@@ -136,7 +146,9 @@ public final class SpiderEngine {
             }
           };
         }
-      } catch (JSONException ignored) {
+      } catch (JSONException brokenIndex) {
+        android.util.Log.w(
+            "Yingxia.Spider", "Lite site index is invalid; using the JAR fallback", brokenIndex);
       }
       return jar(site);
     }
@@ -168,18 +180,25 @@ public final class SpiderEngine {
 
   private JSONObject api(JSONObject site, JSONObject p) throws Exception {
     String api = ConfigCodec.address(site.optString("api"), site.optString("origin"));
-    Map<String, String> query = new LinkedHashMap<>();
-    for (String key : Json.keys(p)) query.put(key, p.optString(key));
-    if (p.has("ids")) query.put("ac", "detail");
-    else if (p.has("wd")) query.put("ac", "detail");
-    else if (p.has("t")) query.put("ac", "detail");
-    if (site.optInt("type") == 4) {
-      query.put("filter", "true");
-      if (p.has("t")) query.put("ac", "detail");
-      if (site.has("ext")) query.put("ext", site.optString("ext"));
-    }
+    Map<String, String> query = Catalog.apiParameters(site, p);
     Http.Result r = http.get(Http.query(api, query), Json.headers(site.optJSONObject("header")));
-    return r.text().trim().startsWith("<") ? xml(r.text()) : new JSONObject(r.text());
+    JSONObject answer = r.text().trim().startsWith("<") ? xml(r.text()) : new JSONObject(r.text());
+    // A plain type-1 home response often omits posters; one detail request fills all of them.
+    if (p.length() == 0 && site.optInt("type") == 1) {
+      JSONArray list = Json.array(answer.opt("list"));
+      List<String> missing = Catalog.idsMissingPosters(list);
+      if (!missing.isEmpty()) {
+        try {
+          JSONObject details = api(site, Json.obj("ids", String.join(",", missing)));
+          answer.put("list", Catalog.fillingPosters(list, Json.array(details.opt("list"))));
+        } catch (Exception detailFailure) {
+          // Posters are optional: retain the usable home answer, but make the degradation visible.
+          android.util.Log.w(
+              "Yingxia.Spider", "Type-1 poster backfill failed; keeping home list", detailFailure);
+        }
+      }
+    }
+    return answer;
   }
 
   private JSONObject xml(String text) throws Exception {
@@ -240,8 +259,8 @@ public final class SpiderEngine {
           }
           if (name.equals("video")) {
             video
-                .put("vod_play_from", String.join("$$$", flags))
-                .put("vod_play_url", String.join("$$$", plays));
+                .put("vod_play_from", String.join("$$", flags))
+                .put("vod_play_url", String.join("$$", plays));
             out.getJSONArray("list").put(video);
             video = null;
           }
@@ -270,8 +289,18 @@ public final class SpiderEngine {
       }
       archive.setReadOnly();
     }
+    byte[] pluginBytes = java.nio.file.Files.readAllBytes(archive.toPath());
+    byte[] normalized = PluginLocator.normalizeZip(pluginBytes);
+    File dexArchive = archive;
+    if (normalized != pluginBytes) {
+      dexArchive = new File(root, "plugin-normalized.jar");
+      try (FileOutputStream out = new FileOutputStream(dexArchive)) {
+        out.write(normalized);
+      }
+      dexArchive.setReadOnly();
+    }
     boolean dex = false;
-    try (ZipFile zip = new ZipFile(archive)) {
+    try (ZipFile zip = new ZipFile(dexArchive)) {
       Enumeration<? extends ZipEntry> entries = zip.entries();
       while (entries.hasMoreElements()) {
         ZipEntry e = entries.nextElement();
@@ -292,18 +321,30 @@ public final class SpiderEngine {
     if (!dex) throw new IOException("此 JAR 没有 Android DEX 字节码，请使用 Android 版插件");
     DexClassLoader loader =
         new DexClassLoader(
-            archive.getAbsolutePath(),
+            dexArchive.getAbsolutePath(),
             root.getAbsolutePath(),
             root.getAbsolutePath(),
             context.getClassLoader());
     try {
       Class<?> init = loader.loadClass("com.github.catvod.spider.Init");
       init.getMethod("init", Context.class).invoke(null, context);
-    } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+    } catch (ClassNotFoundException | NoSuchMethodException optionalHook) {
+      android.util.Log.d("Yingxia.Spider", "Plugin has no optional Init.init hook");
     }
     String name = site.optString("api").substring(4);
     if (!name.contains(".")) name = "com.github.catvod.spider." + name;
-    Object object = loader.loadClass(name).getDeclaredConstructor().newInstance();
+    Class<?> spiderType;
+    try {
+      spiderType = loader.loadClass(name);
+    } catch (ClassNotFoundException missing) {
+      Set<String> candidates = PluginLocator.spiderClasses(normalized);
+      if (candidates.size() != 1) {
+        throw new IOException("插件中找不到 " + name + "，DEX 候选类=" + candidates, missing);
+      }
+      name = "com.github.catvod.spider." + candidates.iterator().next();
+      spiderType = loader.loadClass(name);
+    }
+    Object object = spiderType.getDeclaredConstructor().newInstance();
     if (!(object instanceof Spider)) throw new IOException("插件没有实现 CatVod Spider 接口");
     Spider spider = (Spider) object;
     spider.siteKey = site.optString("id", site.optString("key"));
@@ -313,31 +354,36 @@ public final class SpiderEngine {
     spider.local = new com.github.catvod.utils.Local(spider.siteKey);
     spider.init(context, site.optString("ext"));
     jarSpiders.put(spider.siteKey, spider);
+    JarCallGuard guard = new JarCallGuard();
     return new Session() {
       public JSONObject call(JSONObject p) throws Exception {
-        String answer;
-        if (p.has("play"))
-          answer =
-              spider.playerContent(
-                  p.optString("flag"), p.optString("play"), Collections.emptyList());
-        else if (p.has("ids"))
-          answer = spider.detailContent(Arrays.asList(p.optString("ids").split(",")));
-        else if (p.has("wd"))
-          answer = spider.searchContent(p.optString("wd"), false, p.optString("pg", "1"));
-        else if (p.has("t"))
-          answer =
-              spider.categoryContent(
-                  p.optString("t"),
-                  p.optString("pg", "1"),
-                  true,
-                  new HashMap<>(Json.headers(Json.object(p.optString("filters", "{}")))));
-        else {
-          JSONObject home = Json.object(spider.homeContent(true));
-          JSONObject videos = Json.object(spider.homeVideoContent());
-          if (videos.has("list")) home.put("list", videos.opt("list"));
-          return home;
-        }
-        return new JSONObject(answer);
+        return guard.call(
+            p,
+            () -> {
+              String answer;
+              if (p.has("play"))
+                answer =
+                    spider.playerContent(
+                        p.optString("flag"), p.optString("play"), Collections.emptyList());
+              else if (p.has("ids"))
+                answer = spider.detailContent(Arrays.asList(p.optString("ids").split(",")));
+              else if (p.has("wd"))
+                answer = spider.searchContent(p.optString("wd"), false, p.optString("pg", "1"));
+              else if (p.has("t"))
+                answer =
+                    spider.categoryContent(
+                        p.optString("t"),
+                        p.optString("pg", "1"),
+                        true,
+                        new HashMap<>(Json.headers(Json.object(p.optString("filters", "{}")))));
+              else {
+                JSONObject home = Json.object(spider.homeContent(true));
+                JSONObject videos = Json.object(spider.homeVideoContent());
+                if (videos.has("list")) home.put("list", videos.opt("list"));
+                return home;
+              }
+              return new JSONObject(answer);
+            });
       }
 
       public void close() {
@@ -364,41 +410,32 @@ public final class SpiderEngine {
 
   public JSONObject playback(JSONObject site, JSONObject video, JSONObject episode)
       throws Exception {
+    return playback(site, video, episode, 0);
+  }
+
+  public JSONObject playback(JSONObject site, JSONObject video, JSONObject episode, int quality)
+      throws Exception {
     String url = episode.optString("url");
     JSONObject answer;
-    if (site.length() == 0 || Catalog.direct(url)) answer = Json.obj("url", url, "parse", 0);
-    else answer = call(site, Json.obj("play", url, "flag", episode.optString("flag")));
-    url = answer.optString("url");
-    if (url.isEmpty()) throw new IOException("源没有返回播放地址");
-    if (answer.optInt("parse") == 1) {
-      JSONArray parses = Json.array(site.opt("parses"));
-      boolean resolved = false;
-      for (JSONObject parse : Json.objects(parses)) {
-        if (parse.optInt("type") == 1)
-          try {
-            JSONObject parsed =
-                http.json(parse.optString("url") + java.net.URLEncoder.encode(url, "UTF-8"));
-            if (parsed.has("url")) {
-              answer = parsed;
-              url = parsed.optString("url");
-              resolved = true;
-              break;
-            }
-          } catch (Exception ignored) {
-          }
-      }
-      if (!resolved) throw new IOException("此线路需要网页解析，请尝试其他线路或配置 JSON 解析接口");
+    if (site.length() == 0) {
+      answer = Json.obj("url", url, "parse", 0);
+    } else if (site.optInt("type") == 0 || site.optInt("type") == 1) {
+      // CMS sources have no spider playerContent call: their site-level playUrl routes the page.
+      answer = Json.obj("url", url, "parse", 0, "playUrl", site.optString("playUrl"));
+    } else {
+      answer = call(site, Json.obj("play", url, "flag", episode.optString("flag")));
     }
-    String[] address = url.split("\\|", 2);
-    JSONObject headers = answer.optJSONObject("header");
-    if (headers == null) headers = Json.object(answer.optString("header", "{}"));
-    if (answer.has("ua")) headers.put("User-Agent", answer.optString("ua"));
-    if (answer.has("referer")) headers.put("Referer", answer.optString("referer"));
-    if (address.length == 2)
-      for (String pair : address[1].split("&")) {
-        String[] kv = pair.split("=", 2);
-        if (kv.length == 2) headers.put(kv[0], java.net.URLDecoder.decode(kv[1], "UTF-8"));
-      }
+    PlaybackResolver.Plan plan = PlaybackResolver.plan(site, answer, episode);
+    PlaybackResolver.Resolved resolved =
+        new PlaybackResolver((address, headers) -> http.get(address, headers).text(), null)
+            .resolve(plan, quality);
+    url = resolved.url;
+    JSONArray qualities = new JSONArray();
+    for (int index = 0; index < plan.choices.size(); index++) {
+      PlaybackResolver.Choice choice = plan.choices.get(index);
+      qualities.put(Json.obj("name", choice.name, "index", index));
+    }
+    JSONObject headers = new JSONObject(resolved.headers);
     String id =
         site.optString("id") + "@" + video.optString("vod_id") + "@" + episode.optString("id");
     JSONObject play =
@@ -412,7 +449,11 @@ public final class SpiderEngine {
             "episode",
             episode.optString("name"),
             "url",
-            address[0],
+            url,
+            "qualities",
+            qualities,
+            "quality",
+            quality,
             "header",
             headers,
             "poster",
@@ -427,7 +468,7 @@ public final class SpiderEngine {
             new JSONArray(Catalog.episodes(video)),
             "updated",
             System.currentTimeMillis());
-    if (answer.has("subt")) play.put("subtitles", answer.opt("subt"));
+    PlaybackResolver.passThrough(answer, play);
     return play;
   }
 
@@ -442,7 +483,7 @@ public final class SpiderEngine {
     for (JSONObject episode : Catalog.episodes(video)) {
       if (episode.optString("name").equals(oldEpisode.optString("name"))
           && episode.optString("flag").equals(oldEpisode.optString("flag"))) {
-        JSONObject play = playback(currentSite, video, episode);
+        JSONObject play = playback(currentSite, video, episode, saved.optInt("quality", 0));
         play.put("position", saved.optBoolean("completed") ? 0 : saved.optLong("position"));
         return play;
       }

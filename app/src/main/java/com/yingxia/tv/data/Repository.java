@@ -10,19 +10,41 @@ import org.json.*;
 
 /** Local, atomic snapshots. An unsuccessful refresh never replaces a working subscription. */
 public final class Repository {
+  public static final String DEFAULT_SUBSCRIPTION =
+      "https://raw.githubusercontent.com/qist/tvbox/master/fty.json";
   private final Context context;
   private final AtomicFile file;
   private JSONObject state;
+  private final SourceSupport sourceSupport;
   public final SharedPreferences settings;
 
   public Repository(Context c) {
     context = c;
     file = new AtomicFile(new File(c.getFilesDir(), "library.json"));
+    boolean firstRun = !file.getBaseFile().exists()
+        && !new File(c.getFilesDir(), "library.json.bak").exists();
     settings = c.getSharedPreferences("settings", 0);
+    try (InputStream index = c.getAssets().open("scripts/sites/index.json");
+        InputStream policy = c.getAssets().open("source-support.json")) {
+      sourceSupport = new SourceSupport(
+          new JSONObject(new String(read(index), StandardCharsets.UTF_8)),
+          new JSONObject(new String(read(policy), StandardCharsets.UTF_8)));
+    } catch (Exception error) {
+      throw new IllegalStateException("无法读取源适配清单", error);
+    }
     try (InputStream in = file.openRead()) {
       state = new JSONObject(new String(read(in), StandardCharsets.UTF_8));
     } catch (Exception e) {
       state = Json.obj();
+    }
+    if (firstRun) {
+      // A bundled snapshot makes first launch usable without downloading a config file.
+      // Never re-add it after deletion, or overwrite an existing user's subscriptions.
+      try (InputStream defaults = c.getAssets().open("default-subscription.json")) {
+        importConfig(read(defaults), DEFAULT_SUBSCRIPTION, "饭太硬 · 默认订阅");
+      } catch (Exception error) {
+        throw new IllegalStateException("无法初始化默认订阅", error);
+      }
     }
   }
 
@@ -85,28 +107,8 @@ public final class Repository {
   }
 
   public synchronized List<JSONObject> sites() {
-    List<JSONObject> result = new ArrayList<>();
-    Set<String> seen = new HashSet<>();
-    for (JSONObject sub : subscriptions())
-      if (sub.optBoolean("enabled", true)) {
-        JSONObject config = Json.child(sub, "config");
-        for (JSONObject raw : Json.objects(Json.array(config.opt("sites")))) {
-          String key = raw.optString("key");
-          if (key.isEmpty() || raw.optString("api").trim().isEmpty()) continue;
-          String id = sub.optString("id") + "@" + key;
-          if (!seen.add(id)) continue;
-          JSONObject site = Json.copy(raw);
-          try {
-            site.put("id", id)
-                .put("origin", sub.optString("origin"))
-                .put("subscription", sub.optString("name"))
-                .put("spider", config.optString("spider"))
-                .put("parses", Json.array(config.opt("parses")));
-          } catch (Exception ignored) {
-          }
-          if (!settings.getBoolean("hidden." + id, false)) result.add(site);
-        }
-      }
+    List<JSONObject> result = SubscriptionMerge.sites(enabledSubscriptions());
+    result.removeIf(site -> !isSourceVisible(site));
     result.sort(
         Comparator.comparing(
             (JSONObject x) -> !settings.getBoolean("pin." + x.optString("id"), false)));
@@ -114,21 +116,40 @@ public final class Repository {
   }
 
   public synchronized List<JSONObject> lives() {
+    return SubscriptionMerge.lives(enabledSubscriptions());
+  }
+
+  public boolean isSourceVisible(JSONObject site) {
+    return sourceSupport.reason(site) == null
+        && !settings.getBoolean("hidden." + site.optString("id"), false);
+  }
+
+  /** Read-only backlog diagnostics; never deletes imported configuration. */
+  public synchronized List<JSONObject> deferredSites() {
     List<JSONObject> result = new ArrayList<>();
-    for (JSONObject sub : subscriptions())
-      if (sub.optBoolean("enabled", true)) {
-        JSONObject config = Json.child(sub, "config");
-        for (JSONObject raw : Json.objects(Json.array(config.opt("lives")))) {
-          JSONObject live = Json.copy(raw);
-          try {
-            live.put("origin", sub.optString("origin"))
-                .put("id", sub.optString("id") + "@" + raw.optString("name"));
-          } catch (Exception ignored) {
-          }
-          result.add(live);
-        }
-      }
+    for (JSONObject site : SubscriptionMerge.sites(enabledSubscriptions())) {
+      String reason = sourceSupport.reason(site);
+      if (reason != null) result.add(Json.obj("key", site.optString("key"),
+          "name", site.optString("name"), "api", site.optString("api"), "reason", reason));
+    }
     return result;
+  }
+
+  /** Unsupported history/favorites remain intact in the stored library. */
+  public synchronized List<JSONObject> visibleLibrary(String key) {
+    List<JSONObject> result = Json.objects(list(key));
+    result.removeIf(item -> {
+      if (item.has("cloudServer") || item.has("cloudFile")) return true;
+      JSONObject site = item.optJSONObject("site");
+      return site != null && site.length() > 0 && !isSourceVisible(site);
+    });
+    return result;
+  }
+
+  private List<JSONObject> enabledSubscriptions() {
+    List<JSONObject> out = new ArrayList<>();
+    for (JSONObject sub : subscriptions()) if (sub.optBoolean("enabled", true)) out.add(sub);
+    return out;
   }
 
   public synchronized JSONObject site(String id) {
@@ -176,16 +197,8 @@ public final class Repository {
 
   public synchronized void progress(JSONObject play, long position, long duration) {
     if (position < 1000) return;
-    JSONObject item = Json.copy(play);
-    try {
-      item.put("id", play.optString("historyId", play.optString("id")))
-          .put("position", position)
-          .put("duration", duration)
-          .put("updated", System.currentTimeMillis())
-          .put("completed", duration > 0 && position > duration * .95);
-    } catch (Exception ignored) {
-    }
-    upsert("history", item, "id", true, 300);
+    JSONObject item = PlaybackHistory.entry(play, position, duration, System.currentTimeMillis());
+    save("history", PlaybackHistory.upsert(list("history"), item));
   }
 
   public synchronized String export() {
@@ -194,17 +207,12 @@ public final class Repository {
 
   /** Account credentials stay on the device when sharing a library backup. */
   public synchronized String exportWithoutAccounts() {
-    JSONObject library = Json.copy(state);
-    library.remove("servers");
-    for (String section : Arrays.asList("history", "favorites", "downloads")) {
-      JSONArray items = Json.array(library.opt(section));
-      for (JSONObject item : Json.objects(items)) {
-        item.remove("cloudServer");
-        item.remove("header");
-        if (item.has("cloudFile")) item.remove("url");
-      }
-    }
-    return Json.obj("format", "yingxia-android-library-v1", "library", library).toString();
+    return Json.obj(
+            "format",
+            "yingxia-android-library-v1",
+            "library",
+            LibraryBackup.withoutAccounts(state))
+        .toString();
   }
 
   public synchronized void restore(String text) throws Exception {

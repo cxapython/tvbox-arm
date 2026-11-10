@@ -154,13 +154,22 @@ public class CompatibilityTest {
     JSONObject v =
         Json.obj(
             "vod_play_from",
-            "线路一$$$线路二",
+            "线路一$$线路二",
             "vod_play_url",
-            "第1集$https://example.com/v?a=$token#第2集$https://example.com/2$$$正片$https://example.com/3");
+            "第1集$https://example.com/v?a=$token#第2集$https://example.com/2$$正片$https://example.com/3");
     List<JSONObject> e = Catalog.episodes(v);
     assertEquals(3, e.size());
     assertEquals("https://example.com/v?a=$token", e.get(0).optString("url"));
     assertEquals("线路二", e.get(2).optString("flag"));
+    // 原版语义：集 id 为 "线路序号-集序号"，线路名不足时不造占位名。
+    assertEquals("0-0", e.get(0).optString("id"));
+    assertEquals("1-0", e.get(2).optString("id"));
+    JSONObject sparse =
+        Json.obj("vod_play_from", "仅一路", "vod_play_url", "上$a$$下$b$$正片$https://m/1.m3u8");
+    List<JSONObject> s = Catalog.episodes(sparse);
+    assertEquals("", s.get(0).optString("flag")); // 直媒体线路提前后，第二路没有名字就是空串
+    assertEquals("https://m/1.m3u8", s.get(0).optString("url"));
+    assertEquals("仅一路", s.get(1).optString("flag"));
   }
 
   @Test
