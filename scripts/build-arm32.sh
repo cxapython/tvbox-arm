@@ -13,8 +13,12 @@ if [ ! -f "$signing_key" ]; then
     echo '缺少签名文件；先运行 ./gradlew assembleDebug 创建本机开发证书。' >&2
     exit 1
 fi
-"$build_tools/apksigner" sign --ks "$signing_key" --ks-key-alias androiddebugkey \
-    --ks-pass pass:android --key-pass pass:android \
+# Passwords are passed through the environment, never expanded into command-line arguments.
+YINGXIA_STORE_PASSWORD=${YINGXIA_STORE_PASSWORD:-android}
+YINGXIA_KEY_PASSWORD=${YINGXIA_KEY_PASSWORD:-android}
+export YINGXIA_STORE_PASSWORD YINGXIA_KEY_PASSWORD
+"$build_tools/apksigner" sign --ks "$signing_key" --ks-key-alias "${YINGXIA_KEY_ALIAS:-androiddebugkey}" \
+    --ks-pass env:YINGXIA_STORE_PASSWORD --key-pass env:YINGXIA_KEY_PASSWORD \
     --out artifacts/yingxia-tv-arm32.apk \
     app/build/outputs/apk/release/app-release-unsigned.apk
 "$build_tools/apksigner" verify --verbose artifacts/yingxia-tv-arm32.apk
