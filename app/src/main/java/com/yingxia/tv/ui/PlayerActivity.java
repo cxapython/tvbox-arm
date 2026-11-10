@@ -92,7 +92,10 @@ public final class PlayerActivity extends Activity {
     root = new FrameLayout(this);
     root.setBackgroundColor(Color.BLACK);
     setContentView(root);
-    view = new PlayerView(this);
+    view =
+        (PlayerView)
+            getLayoutInflater().inflate(com.yingxia.tv.R.layout.tv_player_view, root, false);
+    bindSeekControlIcons();
     view.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING);
     view.setKeepContentOnPlayerReset(true);
     view.setControllerAutoShow(true);
@@ -172,6 +175,14 @@ public final class PlayerActivity extends Activity {
                       });
                 }
               });
+    }
+  }
+
+  private void bindSeekControlIcons() {
+    for (boolean forward : new boolean[] {false, true}) {
+      ImageView button = view.findViewById(PlayerControlIcons.viewId(forward));
+      if (button == null) throw new IllegalStateException("播放控制栏缺少快进/快退按钮");
+      button.setImageResource(PlayerControlIcons.resource(forward));
     }
   }
 

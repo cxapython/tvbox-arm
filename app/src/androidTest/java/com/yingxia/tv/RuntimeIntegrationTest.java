@@ -403,6 +403,42 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
     media.delete();
   }
 
+  public void testSeekControlsUseVectorButtons() throws Exception {
+    File media = new File(getActivity().getFilesDir(), "seek-controls-video.mp4");
+    try (InputStream in = getInstrumentation().getContext().getAssets().open("playback.mp4");
+        OutputStream out = new FileOutputStream(media)) {
+      byte[] buffer = new byte[8192];
+      for (int count; (count = in.read(buffer)) != -1; ) out.write(buffer, 0, count);
+    }
+    Instrumentation.ActivityMonitor monitor =
+        getInstrumentation().addMonitor(PlayerActivity.class.getName(), null, false);
+    PlayerActivity player = null;
+    try {
+      JSONObject play = Json.obj("id", "seek-controls", "name", "控制栏测试", "url", UriString(media));
+      getInstrumentation().runOnMainSync(() -> PlayerActivity.open(getActivity(), play));
+      player = (PlayerActivity) monitor.waitForActivityWithTimeout(10000);
+      assertNotNull(player);
+      getInstrumentation().waitForIdleSync();
+      android.widget.ImageButton rewind =
+          player.getWindow().getDecorView().findViewById(androidx.media3.ui.R.id.exo_rew);
+      android.widget.ImageButton forward =
+          player.getWindow().getDecorView().findViewById(androidx.media3.ui.R.id.exo_ffwd);
+      assertNotNull(rewind);
+      assertNotNull(forward);
+      assertTrue(rewind.getDrawable() instanceof android.graphics.drawable.VectorDrawable);
+      assertTrue(forward.getDrawable() instanceof android.graphics.drawable.VectorDrawable);
+      assertTrue(rewind.getContentDescription().toString().contains("快退"));
+      assertTrue(forward.getContentDescription().toString().contains("快进"));
+    } finally {
+      if (player != null) {
+        PlayerActivity target = player;
+        getInstrumentation().runOnMainSync(target::finish);
+      }
+      getInstrumentation().removeMonitor(monitor);
+      media.delete();
+    }
+  }
+
   public void testDpadCanReachEverySectionWithoutCrashing() throws Exception {
     getInstrumentation()
         .runOnMainSync(
