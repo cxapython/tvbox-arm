@@ -1,44 +1,88 @@
-# 映匣 Android TV · ARM32 移植
+# 映匣 TV · Android ARM32
 
-面向小米电视的原生 Android 工程，参考 `tvbox-silicon` 的 tvOS 界面与交互。原版是 Swift / SwiftUI 应用，不能直接编译成 APK；本工程使用 Java、Android 原生视图、Media3 与原版 QuickJS 引擎实现移植。
+**为小米电视、Android TV 和 ARM32 电视盒子打造的原生影音应用。** 横屏大屏布局、方向键焦点导航和遥控器播放操作，基于 [tvbox-silicon / 映匣](https://github.com/jo32/tvbox-silicon) 移植，使用 Java、QuickJS 与 AndroidX Media3。
 
-**当前为预览版，尚未达到原版全部功能与像素级 1:1 一致。** 已实现的范围、测试边界和差异见 [功能对照](docs/PARITY.md)。没有预置商业片源或账户。
+当前版本：`1.8.15-android.4-tv`。最低 Android 5.0 / API 21。电视安装包仅包含 `armeabi-v7a` 原生库。
 
-## 安装
+## 电视上能做什么
 
-构建产物：`artifacts/yingxia-arm32-preview.apk`。仅包含 `armeabi-v7a` 原生库，最低 Android 5.0 / API 21。需要电视系统具有正常工作的 Android MediaCodec 解码器。
+- **电影与电视剧**：片库、分类筛选、分页、全局搜索、详情选集、续播、历史和收藏。
+- **遥控器播放**：暂停、跳转、选集、清晰度、音轨和字幕、倍速、画面比例、跳过片头片尾。
+- **电视直播**：M3U / TXT / TVBox 直播订阅，频道分组和换台。
+- **音乐与电台**：音乐搜索、音质选择、歌词；内置 **ItaloDance Radio**，高／低音质切换、实时歌名与歌手、专辑封面背景、歌曲进度和断流切线。
+- **离线下载**：下载队列、本地缓存和离线读取。
+- **手机辅助输入**：同一网络下通过手机输入订阅地址，支持备份导入导出。
 
-1. 把 APK 复制到 U 盘，在电视文件管理器中打开，并按电视提示允许安装。
-2. 或打开电视的 ADB 调试，然后执行：
+不提供漫画、网盘和媒体服务器功能。未适配或已确认不可用的源会隐藏，原始订阅和历史数据仍保留。
+
+## 默认订阅与内置电台
+
+首次安装已内置饭太硬订阅地址及配置快照，**不用下载配置文件，也不用手动填写地址**：
+
+```text
+https://raw.githubusercontent.com/qist/tvbox/master/fty.json
+```
+
+在「设置」可以刷新、添加或移除订阅。升级不会覆盖已有订阅，主动移除默认订阅后也不会自动加回来。播放仍需联网，内容由订阅方提供。
+
+ItaloDance 不依赖影视订阅，入口为「音乐 → ItaloDance 电台」或「直播 → 内置电台」。电台采用 ItaloSound 的公开直播流与正在播放接口，展示逻辑参考同作者 Mp4Hub 的 ARM32 TV 实现；退出页面即停止播放。
+
+![ItaloDance 电视布局，手机横屏实测](docs/images/italodance-tv.png)
+
+### 当前“不卡”源验证
+
+| 源 | 当前状态 |
+|---|---|
+| 光影 | 手机验证正片总时长、连续播放 35 秒及跳至两分钟后继续解码 |
+| 瓜子 | 修复 User-Agent 被覆盖导致只有约 20 秒短片的问题；剧集第 1、2 集及电影正片验证通过 |
+| 比特 | 手机验证正片总时长、连续播放 35 秒及跳至两分钟后继续解码 |
+| 立播 | 已有 JS，但当前域名和公布的备用域名返回地区限制；暂时隐藏 |
+| 厂长、海绵 | 新插件暂无对应 JS；隐藏并列入二期 |
+
+源脚本可执行不等于所有影片、线路都可播放。当前默认配置的 48 项源中展示 23 项、隐藏 25 项；适配规则对刷新或新导入的配置同样生效。完整范围与后续事项见 [源适配记录](docs/SOURCE_SUPPORT.md)。
+
+## 安装到电视
+
+从源码构建后，电视包位于 **`artifacts/yingxia-tv-arm32.apk`**。将其复制到 U 盘，在电视文件管理器中打开安装；也可以使用 ADB：
 
 ```sh
 adb connect 电视IP:5555
-adb install -r artifacts/yingxia-arm32-preview.apk
+adb install -r artifacts/yingxia-tv-arm32.apk
 ```
 
-启动「映匣」，在「设置」添加 TVBox / M3U / TXT 订阅。也可以打开「手机输入」，使用同一网络下的手机扫码输入地址。方向键移动、确定键打开、长按确定显示管理菜单；返回键先返回上页或侧栏，再返回首页。
+打开电视桌面上的「映匣」。应用注册了 Android TV 桌面入口，不要求触摸屏。
 
-预览 APK 使用本机构建环境的 Android 开发签名。它适合自用测试，后续覆盖安装需保留相同签名；正式分发应使用自己的发布证书。
+| 遥控操作 | 功能 |
+|---|---|
+| 方向键 | 在侧栏、海报、选集和按钮间移动焦点 |
+| 确定键 | 打开内容、执行按钮或显示播放控制 |
+| 长按确定键 | 置顶／隐藏源、管理收藏或下载剧集等菜单 |
+| 返回键 | 返回上一页、侧栏或退出播放器 |
+| 电台播放／暂停键 | 播放或暂停直播音频 |
 
-## 构建
+> 当前已在 realme RMX3350 / Android 13 手机上验证，之前也完成 ARM64 Android TV 模拟器检查。ARM32 库已通过编译、签名和 ELF 检查，尚未在 ARM32 小米电视实机验证。实际视频编码支持取决于电视硬件解码器。
 
-需要 JDK 17 或更新版本、Android SDK 34、Build Tools 34.0.0、NDK 28.2.13676358、CMake 3.22.1。在 `local.properties` 写入本机的 `sdk.dir`。
+## 构建电视 APK
+
+需要 JDK 17+、Android SDK 34、Build Tools 34.0.0、NDK 28.2.13676358、CMake 3.22.1 和 Python 3。QuickJS 与源脚本已包含在本仓库，不需要额外克隆 Apple 项目。
 
 ```sh
+git clone https://github.com/cxapython/tvbox-arm.git
+cd tvbox-arm
+# 在 local.properties 中设置 sdk.dir=/你的/Android/sdk
+export ANDROID_HOME=/你的/Android/sdk
+
+# 首次构建时生成本机 Android 开发签名
+./gradlew assembleDebug
+# 单元测试、Lint、ARM32 release 构建、签名和 ABI 校验
 ./scripts/build-arm32.sh
 ```
 
-脚本先同步旁边的原版工程、确认移植基线，再执行单元测试、Lint、release 构建和 APK 签名，并核对 APK 只有 ARM32 原生库。原版基线记录在 [SOURCE_REVISION](docs/SOURCE_REVISION)。
+输出：`artifacts/yingxia-tv-arm32.apk`，校验和：`artifacts/SHA256SUMS`。默认使用本机 Android 开发签名，自用覆盖升级请保留同一份签名。构建不会自动修改或拉取上游源码，移植基线记录在 [SOURCE_REVISION](docs/SOURCE_REVISION)。
 
-手动构建：
+### 手机验证包
 
-```sh
-./gradlew testDebugUnitTest lintDebug assembleRelease
-```
-
-`app/build/outputs/apk/release/app-release-unsigned.apk` 需要签名后才能安装。请勿用 `-Pemulator` 构建给 ARM32 电视的正式产物；该选项额外包含 ARM64，仅用于模拟器验证。
-
-## 验证
+手机测试包额外包含 ARM64。`-Pemulator` 仅用于设备／模拟器验证，电视正式包用上面的 ARM32 构建脚本。
 
 ```sh
 ./gradlew -Pemulator assembleDebug assembleDebugAndroidTest
@@ -49,23 +93,26 @@ adb shell am instrument -w -r \
   com.yingxia.tv.test/android.test.InstrumentationTestRunner
 ```
 
-设备测试实际运行 QuickJS/JNI、DEX 插件、HTTP、本机代理、MediaCodec、订阅存储和离线缓存。Android 12 ARM64 TV 模拟器的通过结果不等于 ARM32 小米电视实机验证。最低系统版本通过 Lint 和反糖兼容检查，尚未在 Android 5/6 实机上运行。
+真实电台验证：将测试类改为 `com.yingxia.tv.RadioIntegrationTest`。真实影视源测试位于 `LiveSubscriptionTest`，按需运行单个方法，受站点和网络状态影响；不要把只返回地址或只播放短片当作正片成功。
 
-本地界面验证：
+## 项目结构
 
-```sh
-python3 scripts/fixture_server.py --source ../tvbox-silicon
-adb shell am start -n com.yingxia.tv/.ui.MainActivity \
-  --es qaFixture http://10.0.2.2:18765/config.json --ei qaSection 0
-```
+| 目录 | 内容 |
+|---|---|
+| `app/src/main/java/com/yingxia/tv/ui` | 电视主界面、视频播放器、独立电台页面 |
+| `app/src/main/java/com/yingxia/tv/core` | 订阅、片库、源支持规则、播放和电台数据模型 |
+| `app/src/main/java/com/yingxia/tv/data` | 网络、存储、源引擎、缓存和下载 |
+| `app/src/main/assets/scripts` | TVCore 迁入的源 JS 与 QuickJS 宿主环境 |
+| `app/src/main/assets/default-subscription.json` | 默认订阅快照 |
+| `app/src/main/assets/source-support.json` | 暂缓显示的源脚本及原因 |
+| `vendor/QuickJS`、`app/src/main/cpp` | QuickJS 引擎及 Android JNI |
+| `docs` | 验证记录、功能对照和二期清单 |
 
-此入口仅在 debug 构建生效。演示片库不会随正式 APK 安装，图片由原版官网的本地文件提供。`qaSection` 对应侧栏顺序，从 0 到 11；`qaTitle` 可指定搜索词。
+## 文档与许可
 
-## 源码与许可
+- [本版验证记录](docs/TV_RELEASE_REPORT.md)
+- [瓜子 20 秒短片修复](docs/GUAZI_PLAYBACK_FIX.md)
+- [源适配与二期清单](docs/SOURCE_SUPPORT.md)
+- [与原版的功能对照](docs/PARITY.md)
 
-- `app/src/main/java`：Android UI、订阅、播放、漫画、媒体服务器及插件宿主。
-- `app/src/main/assets/scripts`：沿用原版脚本、TVBox 与 Venera 前置环境。
-- `vendor/QuickJS`、`app/src/main/cpp`：原版引擎及 Android JNI 适配。
-- `app/src/test`、`app/src/androidTest`：格式兼容性与设备集成测试。
-
-沿用原版 GPL-3.0-only 许可。第三方来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+沿用原版 **GPL-3.0-only**，见 [LICENSE](LICENSE)；第三方组件和移植来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
