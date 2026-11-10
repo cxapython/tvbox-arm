@@ -19,11 +19,18 @@ import com.yingxia.tv.*;
 import com.yingxia.tv.core.*;
 import com.yingxia.tv.data.*;
 import java.io.*;
+import java.lang.ref.WeakReference;
 import java.util.*;
 import org.json.*;
 
 @androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
 public final class PlayerActivity extends Activity {
+  private static WeakReference<PlayerActivity> active = new WeakReference<>(null);
+
+  public static PlayerActivity current() {
+    return active.get();
+  }
+
   private ExoPlayer player;
   private PlayerView view;
   private FrameLayout root;
@@ -57,6 +64,7 @@ public final class PlayerActivity extends Activity {
   @Override
   public void onCreate(Bundle saved) {
     super.onCreate(saved);
+    active = new WeakReference<>(this);
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     getWindow().getDecorView().setSystemUiVisibility(5894);
     try {
@@ -693,6 +701,7 @@ public final class PlayerActivity extends Activity {
 
   @Override
   protected void onDestroy() {
+    if (current() == this) active.clear();
     released = true;
     operationGeneration++;
     cancelRecovery();

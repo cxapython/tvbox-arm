@@ -426,8 +426,9 @@ public final class SpiderEngine {
       answer = call(site, Json.obj("play", url, "flag", episode.optString("flag")));
     }
     PlaybackResolver.Plan plan = PlaybackResolver.plan(site, answer, episode);
+    PlaybackResolver.Sniffer sniffer = PlaybackWebSniffer.foreground();
     PlaybackResolver.Resolved resolved =
-        new PlaybackResolver((address, headers) -> http.get(address, headers).text(), null)
+        new PlaybackResolver((address, headers) -> http.get(address, headers).text(), sniffer)
             .resolve(plan, quality);
     url = resolved.url;
     JSONArray qualities = new JSONArray();

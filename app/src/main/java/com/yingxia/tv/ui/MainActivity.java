@@ -1498,7 +1498,19 @@ public final class MainActivity extends Activity {
   }
 
   private String discoverLanguage() {
-    return DiscoverCatalog.language(repo.settings.getString("appLanguage", ""), Locale.getDefault());
+    String configured = repo.settings.getString("appLanguage", "");
+    return configured.equals("auto")
+        ? DiscoverCatalog.language(Locale.getDefault())
+        : DiscoverCatalog.language(configured, Locale.getDefault());
+  }
+
+  private String discoverLanguageLabel(String language) {
+    switch (language) {
+      case "zh-CN": return "简体中文";
+      case "zh-TW": return "繁体中文";
+      case "ja-JP": return "日本語";
+      default: return "English";
+    }
   }
 
   private void discover(String feed, int pg) {
@@ -1995,6 +2007,29 @@ public final class MainActivity extends Activity {
                       } catch (Exception e) {
                         toast("请输入秒数");
                       }
+                    })),
+        10);
+    sectionTitle("发现");
+    LinearLayout discovery = actions();
+    String language = discoverLanguage();
+    spaced(
+        discovery,
+        button(
+            this,
+            "发现语言：" + discoverLanguageLabel(language),
+            () ->
+                choose(
+                    "发现语言",
+                    List.of(
+                        Json.obj("id", "auto", "name", "跟随系统"),
+                        Json.obj("id", "zh-CN", "name", "简体中文"),
+                        Json.obj("id", "zh-TW", "name", "繁体中文"),
+                        Json.obj("id", "en-US", "name", "English"),
+                        Json.obj("id", "ja-JP", "name", "日本語")),
+                    value -> value.optString("name"),
+                    value -> {
+                      repo.settings.edit().putString("appLanguage", value.optString("id")).apply();
+                      settings();
                     })),
         10);
     sectionTitle("资料与存储");
