@@ -41,6 +41,7 @@ public final class PlayerActivity extends Activity {
   private EpisodeSkip.Pass skipPass = new EpisodeSkip.Pass(java.util.Collections.emptyList());
 
   public static void open(Context context, JSONObject play) {
+    if (play.optBoolean("music")) { MusicPlayerActivity.open(context, play); return; }
     try {
       File file = new File(context.getCacheDir(), "play-" + UUID.randomUUID() + ".json");
       try (FileOutputStream out = new FileOutputStream(file)) {

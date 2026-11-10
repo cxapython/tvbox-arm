@@ -1662,101 +1662,143 @@ public final class MainActivity extends Activity {
   }
 
   private void music(String provider, String query, int pg) {
-    int token =
-        page(
-            "music",
-            "音乐",
-            Json.obj("provider", provider, "query", query, "page", pg),
-            () -> music(provider, query, pg));
-    LinearLayout radios = actions();
-    spaced(radios, button(this, "♫ ItaloDance 电台", () -> RadioActivity.open(this)), 10);
+    music(provider, query, pg, "song", null);
+  }
+
+  private void music(String provider, String query, int pg, String kind, JSONObject cached) {
+    int token = page("music", "音乐", Json.obj("provider", provider, "query", query, "page", pg, "kind", kind),
+        () -> music(provider, query, pg, kind, null));
+    spaced(header, button(this, "♫ ItaloDance 电台", () -> RadioActivity.open(this)), 0);
     LinearLayout platforms = actions();
     String[][] options = {
-      {"netease", "网易云音乐"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"},
+      {"netease", "GD 音乐台 · 网易云"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"},
       {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}
     };
     for (String[] p : options)
-      spaced(
-          platforms,
-          button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1)),
-          10);
-    String musicQuality = MusicResolver.normalizeQuality(repo.settings.getString("musicQuality", MusicResolver.HIGH));
-    String qualityLabel = musicQuality.equals(MusicResolver.FLAC) ? "FLAC 无损" : musicQuality + " kbps";
-    spaced(
-        platforms,
-        button(
-            this,
-            "音质：" + qualityLabel,
-            () ->
-                new AlertDialog.Builder(this)
-                    .setTitle("音乐音质")
-                    .setItems(
-                        new String[] {"FLAC 无损", "320 kbps", "128 kbps"},
-                        (dialog, selected) -> {
-                          String quality = selected == 0 ? MusicResolver.FLAC : selected == 1 ? MusicResolver.HIGH : MusicResolver.STANDARD;
-                          repo.settings.edit().putString("musicQuality", quality).apply();
-                          music(provider, query, pg);
-                        })
-                    .setNegativeButton("取消", null)
-                    .show()),
-        10);
+      spaced(platforms, button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1)), 10);
+    LinearLayout controls = actions();
+    String quality = MusicResolver.normalizeQuality(repo.settings.getString("musicQuality", MusicResolver.HIGH));
+    String qualityLabel = quality.equals(MusicResolver.FLAC) ? "FLAC 无损" : quality + " kbps";
+    spaced(controls, button(this, "优先音质：" + qualityLabel, () -> new AlertDialog.Builder(this)
+        .setTitle("音乐音质")
+        .setItems(new String[] {"FLAC 无损", "320 kbps", "128 kbps"}, (dialog, selected) -> {
+          repo.settings.edit().putString("musicQuality", selected == 0 ? MusicResolver.FLAC : selected == 1 ? MusicResolver.HIGH : MusicResolver.STANDARD).apply();
+          music(provider, query, pg, kind, (JSONObject) currentPage.data());
+        }).setNegativeButton("取消", null).show()), 10);
+    if (MusicClient.hasCollections(provider)) {
+      spaced(controls, button(this, "榜单 / 推荐", () -> music(provider, "", 1)), 10);
+      String[][] kinds = {{"song", "歌曲"}, {"playlist", "歌单"}, {"album", "专辑"}};
+      for (String[] item : kinds)
+        spaced(controls, button(this, (kind.equals(item[0]) ? "✓ " : "") + item[1],
+            () -> music(provider, query, 1, item[0], null)), 10);
+      body.addView(text(this, provider.equals("netease") ? "音源：GD 音乐台 · music.gdstudio.xyz · 仅限个人非商业使用" : "QQ 音乐 · 榜单、歌单和专辑", 12, SECONDARY));
+      gap(body, 12);
+    }
     LinearLayout row = horizontal(this);
-    EditText input = edit("搜索歌曲、歌手、专辑", query);
+    EditText input = edit("搜索歌曲、歌手、歌单或专辑", query);
     row.addView(input, new LinearLayout.LayoutParams(0, dp(this, 52), 1));
-    spaced(
-        row,
-        button(
-            this,
-            "搜索",
-            () -> {
-              hideKeyboard(input);
-              music(provider, input.getText().toString().trim(), 1);
-            }),
-        12);
+    Runnable search = () -> {
+      hideKeyboard(input);
+      music(provider, input.getText().toString().trim(), 1, kind, null);
+    };
+    input.setOnEditorActionListener((v, action, event) -> {
+      if (action != EditorInfo.IME_ACTION_SEARCH) return false;
+      search.run();
+      return true;
+    });
+    spaced(row, button(this, "搜索", search), 12);
     body.addView(row);
     gap(body, 18);
     if (query.isEmpty()) {
       List<JSONObject> recent = new ArrayList<>();
-      for (JSONObject s : Json.objects(repo.list("history")))
-        if (s.optBoolean("music")) recent.add(s);
+      for (JSONObject song : Json.objects(repo.list("history"))) if (song.optBoolean("music")) recent.add(song);
       if (!recent.isEmpty()) {
         sectionTitle("继续播放");
-        tiles(
-            recent,
-            s -> s.optString("name"),
-            s -> s.optString("artist"),
-            s -> resume(s),
-            null);
-      } else empty("♫", "让音乐充满客厅", "搜索你喜欢的歌曲，选择一个音源开始播放。", null, null);
-      return;
+        tiles(recent, song -> song.optString("name"), song -> song.optString("artist"), this::resume, null);
+      }
+      if (!MusicClient.hasCollections(provider)) {
+        if (recent.isEmpty()) empty("♫", "让音乐充满客厅", "搜索你喜欢的歌曲，选择一个音源开始播放。", null, null);
+        return;
+      }
     }
+    Consumer<JSONObject> render = result -> {
+      loaded();
+      loaded(result);
+      if (query.isEmpty()) {
+        List<JSONObject> sections = Json.objects(Json.array(result.opt("sections")));
+        if (sections.isEmpty()) body.addView(text(this, "暂无推荐，可搜索歌曲、歌单或专辑。", 16, SECONDARY));
+        for (JSONObject section : sections) {
+          sectionTitle(section.optString("name"));
+          musicCollections(Json.objects(Json.array(section.opt("items"))));
+        }
+      } else {
+        List<JSONObject> items = Json.objects(Json.array(result.opt("items")));
+        if (items.isEmpty()) body.addView(text(this, "没有更多结果，试试其他关键词。", 16, SECONDARY));
+        if (kind.equals("song") || !MusicClient.hasCollections(provider)) musicSongs(items);
+        else musicCollections(items);
+        pagination(pg, items.size() == GdMusicCatalog.PAGE_SIZE ? pg + 1 : pg,
+            next -> music(provider, query, next, kind, null));
+      }
+    };
+    if (cached != null) { render.accept(cached); return; }
     loading();
-    async(
-        token,
-        () -> new MusicClient().search(query, provider, pg),
-        songs -> {
-          loaded();
-          if (songs.isEmpty()) {
-            empty("♫", "没有找到歌曲", "换一个关键词或音乐平台。", null, null);
-            return;
-          }
-          tiles(
-              songs,
-              s -> s.optString("name"),
-              s -> s.optString("artist") + " · " + s.optString("album"),
-              song -> {
-                toast("正在准备音源…");
-                async(
-                    generation,
-                    () -> new MusicClient().play(song, repo.settings.getString("musicQuality", MusicResolver.HIGH)),
-                    play -> PlayerActivity.open(this, play));
-              },
-              song -> {
-                repo.favorite(song);
-                toast("已更新收藏");
+    async(token, () -> {
+      MusicClient client = new MusicClient();
+      if (query.isEmpty()) return Json.obj("sections", new JSONArray(client.browse(provider)));
+      List<JSONObject> items = MusicClient.hasCollections(provider) && !kind.equals("song")
+          ? client.collections(query, provider, kind, pg) : client.search(query, provider, pg);
+      return Json.obj("items", new JSONArray(items));
+    }, render, message -> {
+      loaded();
+      body.addView(text(this, message, 16, SECONDARY));
+      body.addView(button(this, "重试", () -> music(provider, query, pg, kind, null)));
+    });
+  }
+
+  private void musicCollections(List<JSONObject> collections) {
+    grid(collections, item -> item.optString("name"),
+        item -> item.optString("subtitle") + (item.optInt("trackCount") > 0 ? " · " + item.optInt("trackCount") + " 首" : ""),
+        item -> item.optString("poster"), item -> push(() -> musicCollection(item, 1, null)));
+  }
+
+  private void musicCollection(JSONObject collection, int pg, List<JSONObject> cached) {
+    int token = page("musicCollection", collection.optString("name"), Json.obj("collection", collection, "page", pg),
+        () -> musicCollection(collection, pg, null));
+    body.addView(text(this, MusicClient.platformName(collection.optString("source", "netease")) + " · 长按歌曲收藏", 14, SECONDARY));
+    Consumer<List<JSONObject>> render = songs -> {
+      loaded();
+      loaded(songs);
+      if (songs.isEmpty()) {
+        empty("♫", "暂无可用歌曲", "该歌单或专辑暂未返回歌曲。", null, null);
+        return;
+      }
+      int pages = (songs.size() + GdMusicCatalog.PAGE_SIZE - 1) / GdMusicCatalog.PAGE_SIZE;
+      int selected = Math.max(1, Math.min(pg, pages));
+      sectionTitle(songs.size() + " 首歌曲");
+      musicSongs(songs.subList((selected - 1) * GdMusicCatalog.PAGE_SIZE, Math.min(songs.size(), selected * GdMusicCatalog.PAGE_SIZE)), songs, collection.optString("name"));
+      pagination(selected, pages, next -> musicCollection(collection, next, songs));
+    };
+    if (cached != null) { render.accept(cached); return; }
+    loading();
+    async(token, () -> new MusicClient().tracks(collection), render);
+  }
+
+  private void musicSongs(List<JSONObject> songs) {
+    musicSongs(songs, null, "");
+  }
+
+  private void musicSongs(List<JSONObject> songs, List<JSONObject> queue, String source) {
+    tiles(songs, song -> song.optString("name"),
+        song -> song.optString("artist") + " · " + song.optString("album") +
+            (song.optLong("duration") > 0 ? " · " + formatTime(song.optLong("duration")) : ""),
+        song -> {
+          toast("正在准备音源…");
+          async(generation, () -> new MusicClient().play(song, repo.settings.getString("musicQuality", MusicResolver.HIGH)),
+              play -> {
+                if (queue == null) MusicPlayerActivity.open(this, play);
+                else MusicPlayerActivity.open(this, play, queue, queue.indexOf(song), source);
               });
-          pagination(pg, pg + 1, p -> music(provider, query, p));
-        });
+        }, song -> toast(repo.favorite(song) ? "已收藏歌曲" : "已取消收藏"));
   }
 
   private void downloads() {
@@ -2393,7 +2435,10 @@ public final class MainActivity extends Activity {
         discoverDetail(Json.child(a, "item"), (JSONObject) data);
         break;
       case "music":
-        music(a.optString("provider"), a.optString("query"), a.optInt("page", 1));
+        music(a.optString("provider"), a.optString("query"), a.optInt("page", 1), a.optString("kind", "song"), (JSONObject) data);
+        break;
+      case "musicCollection":
+        musicCollection(Json.child(a, "collection"), a.optInt("page", 1), (List<JSONObject>) data);
         break;
       case "downloads":
         downloads();

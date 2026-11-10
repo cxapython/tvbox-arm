@@ -15,18 +15,84 @@ public final class MusicClient {
   private final YingxiaApp app = YingxiaApp.get();
   private final Http http = app.http;
 
+  public final GdMusicCatalog gd = new GdMusicCatalog(this::musicJson);
+  public final NativeMusicCatalog nativeCatalog = new NativeMusicCatalog(this::catalogJson);
+
+  private JSONObject catalogJson(String url, String method, Map<String, String> query,
+      Map<String, String> extraHeaders, JSONObject body) throws Exception {
+    Map<String, String> headers = Http.params("User-Agent", Http.UA, "Cache-Control", "no-cache");
+    headers.putAll(extraHeaders);
+    if (body != null) headers.put("Content-Type", "application/json");
+    Http.Result response = http.request(Http.query(url, query), method, headers,
+        body == null ? null : body.toString().getBytes(StandardCharsets.UTF_8), 2_000_000, true, 6000);
+    Http.check(response);
+    return response.json();
+  }
+
+  public static boolean hasCollections(String source) { return source.equals("netease") || source.equals("tencent") || source.equals("qq"); }
+
+  public static String platformName(String source) {
+    switch (source) {
+      case "netease": return "GD 音乐台 · 网易云";
+      case "tencent": case "qq": return "QQ 音乐";
+      case "kuwo": return "酷我音乐";
+      case "migu": return "咪咕音乐";
+      case "kugou": return "酷狗音乐";
+      default: return "音乐";
+    }
+  }
+
+  public List<JSONObject> browse(String source) throws Exception {
+    return source.equals("netease") ? gd.browse() : nativeCatalog.browse();
+  }
+
+  public List<JSONObject> collections(String query, String source, String kind, int page) throws Exception {
+    return source.equals("netease") ? gd.searchCollections(query, kind, page) : nativeCatalog.searchCollections(query, kind, page);
+  }
+
+  public List<JSONObject> tracks(JSONObject collection) throws Exception {
+    return collection.optString("source", "netease").equals("netease") ? gd.tracks(collection) : nativeCatalog.tracks(collection);
+  }
+
+
+  private static synchronized void admitGd() throws Exception {
+    admitService("gd", 50, "GD");
+  }
+
+  private static synchronized void admitService(String service, int limit, String label) throws Exception {
+    android.content.SharedPreferences settings = YingxiaApp.get().repository.settings;
+    String key = "music." + service + ".requests";
+    JSONArray recent = MusicRequestBudget.admit(Json.array(settings.getString(key, "[]")), System.currentTimeMillis(), limit, label);
+    settings.edit().putString(key, recent.toString()).apply();
+  }
+
+  private Object musicJson(String url, Map<String, String> query, int timeout) throws Exception {
+    if (url.equals(GdMusicCatalog.API)) admitGd();
+    Http.Result result = http.request(Http.query(url, query), "GET",
+        Http.params("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36",
+            "Referer", url.equals(GdMusicCatalog.API) ? "https://music.gdstudio.xyz/" : "https://music.163.com/",
+            "Cache-Control", "no-cache"), null, 2_000_000, true, timeout);
+    Http.check(result);
+    try { return new JSONTokener(result.text()).nextValue(); }
+    catch (JSONException error) { throw new IOException("音乐接口返回格式无效", error); }
+  }
+
   public List<JSONObject> search(String query, String source, int page) throws Exception {
+    if (source.equals("netease")) return gd.search(query, page);
+    if (Arrays.asList("tencent", "qq", "migu", "kuwo").contains(source)) return nativeCatalog.search(source, query, page);
     String url =
         Http.query(
             "https://music-api.gdstudio.xyz/api.php",
             Http.params(
                 "types", "search", "source", source, "name", query, "count", "20", "pages",
                 "" + page));
+    admitGd();
     JSONArray songs = new JSONArray(http.get(url).text());
     List<JSONObject> out = new ArrayList<>();
     for (JSONObject song : Json.objects(songs))
       out.add(
           Json.obj(
+              "music", true,
               "id",
               source + ":" + song.optString("id"),
               "songId",
@@ -59,29 +125,69 @@ public final class MusicClient {
 
   public JSONObject play(JSONObject song, String quality) throws Exception {
     String normalized = MusicResolver.normalizeQuality(quality);
-    JSONObject stream =
-        new MusicResolver(providers(song.optString("source"))).resolve(song, normalized);
+    try {
+      return playDirect(song, normalized);
+    } catch (Exception first) {
+      // TVCore MusicResolution's companion catalogs: only the same recording can replace a
+      // failing channel. Keep the original library identity while renewing the actual source ID.
+      long deadline = System.nanoTime() + 30_000_000_000L;
+      List<String> failures = new ArrayList<>();
+      failures.add(Json.message(first));
+      for (String platform : Arrays.asList("migu", "kuwo", "netease", "tencent")) {
+        if (platform.equals(song.optString("source")) || System.nanoTime() >= deadline) continue;
+        try {
+          List<JSONObject> matches = search(song.optString("name") + " " + song.optString("artist"), platform, 1);
+          for (JSONObject candidate : matches) {
+            if (!sameRecording(song, candidate)) continue;
+            JSONObject resolved = playDirect(candidate, normalized);
+            resolved.put("id", song.optString("id"))
+                .put("catalogSource", song.optString("catalogSource", song.optString("source")))
+                .put("catalogSongId", song.optString("catalogSongId", song.optString("songId")))
+                .put("sourceFallback", true);
+            return resolved;
+          }
+        } catch (Exception error) { failures.add(platformName(platform) + ": " + Json.message(error)); }
+      }
+      throw new IOException(String.join("；", failures));
+    }
+  }
+
+  private JSONObject playDirect(JSONObject song, String quality) throws Exception {
+    JSONObject stream = new MusicResolver(providers(song.optString("source"))).resolve(song, quality);
     JSONObject play = Json.copy(song);
     for (String key : Json.keys(stream)) play.put(key, stream.opt(key));
-    play.put("quality", normalized)
-        .put("music", true)
-        .put("episode", song.optString("artist"));
+    play.put("quality", quality).put("music", true).put("episode", song.optString("artist"));
     loadCover(song, play);
     return play;
   }
 
   public String lyrics(JSONObject song) throws Exception {
-    return http.json(
-            Http.query(
-                "https://music-api.gdstudio.xyz/api.php",
-                Http.params(
-                    "types",
-                    "lyric",
-                    "source",
-                    song.optString("source"),
-                    "id",
-                    song.optString("lyricId", song.optString("songId")))))
-        .optString("lyric");
+    return lyricData(song).optString("lyric");
+  }
+
+  public JSONObject lyricData(JSONObject song) throws Exception {
+    String source = song.optString("source");
+    String catalog = song.optString("catalogSource");
+    if (catalog.equals("tencent") || catalog.equals("qq")) return nativeCatalog.lyrics(song.optString("catalogSongId"));
+    if (catalog.equals("netease")) return gd.lyric(song.optString("catalogSongId"));
+    if (source.equals("netease")) return gd.lyric(song.optString("songId"));
+    if (source.equals("tencent") || source.equals("qq")) return nativeCatalog.lyrics(song.optString("songId"));
+    if (source.equals("migu") || source.equals("kuwo")) {
+      // TVCore loads lyrics from a matching NetEase/QQ recording. Never use just the title:
+      // artist and duration must agree, otherwise show no lyrics rather than another version.
+      for (JSONObject match : gd.search(song.optString("name") + " " + song.optString("artist"), 1))
+        if (sameRecording(song, match)) return gd.lyric(match.optString("songId"));
+      return Json.obj("lyric", "", "translation", "");
+    }
+    Object result = musicJson(GdMusicCatalog.API, Http.params("types", "lyric", "source",
+        song.optString("source"), "id", song.optString("lyricId", song.optString("songId"))), 6000);
+    if (!(result instanceof JSONObject)) throw new IOException("歌词返回格式无效");
+    JSONObject json = (JSONObject) result;
+    return Json.obj("lyric", json.optString("lyric"), "translation", json.optString("tlyric"));
+  }
+
+  private static boolean sameRecording(JSONObject a, JSONObject b) {
+    return MusicRecordingMatch.same(a, b);
   }
 
   private interface Call {
@@ -110,6 +216,7 @@ public final class MusicClient {
         break;
       case "kw":
         out.add(provider("nianxin/kuwo", this::nianxin));
+        out.add(provider("xinghai/kuwo", this::xinghai));
         break;
       case "tx":
         out.add(provider("vkeys/qq", this::vkeys));
@@ -120,6 +227,7 @@ public final class MusicClient {
       default:
         out.add(provider("gdstudio/netease", this::gdstudio));
         out.add(provider("nianxin/netease", this::nianxin));
+        out.add(provider("xinghai/netease", this::xinghai));
         break;
     }
     out.add(provider("lx", this::lx));
@@ -156,31 +264,35 @@ public final class MusicClient {
   }
 
   private JSONObject gdstudio(JSONObject song, String quality) throws Exception {
-    JSONObject response =
-        http.json(
-            Http.query(
-                "https://music-api.gdstudio.xyz/api.php",
-                Http.params(
-                    "types",
-                    "url",
-                    "source",
-                    song.optString("source"),
-                    "id",
-                    song.optString("songId"),
-                    "br",
-                    MusicResolver.gdstudioBitrate(quality))));
-    return stream(response.optString("url"), "gdstudio", response.optString("br", quality));
+    if (song.optString("source").equals("netease")) return gd.resolve(song.optString("songId"), quality);
+    Object result = musicJson(GdMusicCatalog.API, Http.params("types", "url", "source", song.optString("source"),
+        "id", song.optString("songId"), "br", MusicResolver.gdstudioBitrate(quality)), 8000);
+    if (!(result instanceof JSONObject)) throw new IOException("GD 返回格式无效");
+    return GdMusicCatalog.parseStream((JSONObject) result);
+  }
+
+  private JSONObject providerJson(String url) throws Exception {
+    Http.Result response = http.request(url, "GET", Http.params("Cache-Control", "no-cache"), null, 2_000_000, true, 8000);
+    Http.check(response);
+    return response.json();
   }
 
   private JSONObject vkeys(JSONObject song, String quality) throws Exception {
+    long now = System.currentTimeMillis();
+    if (app.repository.settings.getLong("music.vkeys.retryAfter", 0) > now)
+      throw new IOException("QQ 音源上游风控，暂时冷却");
     JSONObject response =
-        http.json(
+        providerJson(
             Http.query(
                 "https://api.vkeys.cn/music/tencent/song/link",
                 Http.params(
                     "mid", song.optString("songId"), "quality", MusicResolver.vkeysCode(quality))));
-    if (response.optInt("code", -1) != 0)
-      throw new IOException("VKeys: " + response.optString("message", "无可用资源"));
+    if (response.optInt("code", -1) != 0) {
+      String message = response.optString("message", "无可用资源");
+      if (message.contains("风控") || message.contains("風控"))
+        app.repository.settings.edit().putLong("music.vkeys.retryAfter", now + 600_000).apply();
+      throw new IOException("VKeys: " + message);
+    }
     return stream(
         Json.child(response, "data").optString("url"),
         "vkeys",
@@ -194,7 +306,7 @@ public final class MusicClient {
     for (String level : MusicResolver.nianxinLevels(quality)) {
       try {
         JSONObject response =
-            http.json(Http.query(base, Http.params("id", song.optString("songId"), "level", level)));
+            providerJson(Http.query(base, Http.params("id", song.optString("songId"), "level", level)));
         if (response.optInt("code", -1) != 200)
           throw new IOException("Nianxin code " + response.optString("code"));
         JSONObject data = Json.child(response, "data");
@@ -205,6 +317,19 @@ public final class MusicClient {
       }
     }
     throw new IOException("Nianxin 各音质均失败: " + String.join("；", failures));
+  }
+
+  private JSONObject xinghai(JSONObject song, String quality) throws Exception {
+    admitService("xinghai", 30, "星海");
+    boolean kuwo = sourceKey(song.optString("source")).equals("kw");
+    String tier = MusicResolver.normalizeQuality(quality);
+    String level = kuwo ? (tier.equals(MusicResolver.FLAC) ? "flac" : tier + "k")
+        : tier.equals(MusicResolver.FLAC) ? "lossless" : tier.equals(MusicResolver.HIGH) ? "exhigh" : "standard";
+    JSONObject response = catalogJson("https://yy.zddyr.top/lx/api/", "GET",
+        Http.params("source", kuwo ? "kw" : "netease", "name", "", "songmid", song.optString("songId"), "quality", level),
+        Collections.emptyMap(), null);
+    if (response.optInt("code") != 200) throw new IOException("星海暂无可用音源");
+    return stream(Json.text(response, "url", Json.child(response, "data").optString("url")), "xinghai", response.optString("quality", level));
   }
 
   private static final class MiguTier {
@@ -250,7 +375,7 @@ public final class MusicClient {
             null,
             2_000_000,
             true,
-            15000);
+            8000);
     Http.check(response);
     String base = miguAddress(miguJson(response.bytes));
     for (MiguTier tier : miguTiers(quality)) {
@@ -294,7 +419,7 @@ public final class MusicClient {
   private boolean miguExists(String url) {
     try {
       Http.Result response =
-          http.request(url, "HEAD", Collections.emptyMap(), null, 1024, true, 8000);
+          http.request(url, "HEAD", Collections.emptyMap(), null, 1024, true, 4000);
       return response.status >= 200 && response.status < 400;
     } catch (Exception error) {
       Log.d("Yingxia.Music", "Migu quality probe failed: " + Json.message(error));
@@ -399,22 +524,21 @@ public final class MusicClient {
   private void loadCover(JSONObject song, JSONObject play) throws Exception {
     // Keeping the old value (or the empty placeholder) leaves a usable playable object on failure.
     play.put("poster", song.optString("poster", ""));
+    if (!play.optString("poster").isEmpty()) return;
     try {
-      JSONObject picture =
-          http.json(
-              Http.query(
-                  "https://music-api.gdstudio.xyz/api.php",
-                  Http.params(
-                      "types",
-                      "pic",
-                      "source",
-                      song.optString("source"),
-                      "id",
-                      song.optString("picId"),
-                      "size",
-                      "500")));
-      String url = picture.optString("url");
-      if (!url.isEmpty()) play.put("poster", url);
+      if (song.optString("source").equals("netease")) {
+        JSONObject detail = gd.metadata(song.optString("songId"));
+        if (detail != null) play.put("poster", detail.optString("poster")).put("duration", detail.optLong("duration"));
+        return;
+      }
+      String picId = song.optString("picId");
+      if (picId.isEmpty()) return;
+      Object result = musicJson(GdMusicCatalog.API, Http.params("types", "pic", "source",
+          song.optString("source"), "id", picId, "size", "500"), 6000);
+      if (result instanceof JSONObject) {
+        String url = ((JSONObject) result).optString("url");
+        if (!url.isEmpty()) play.put("poster", url);
+      }
     } catch (Exception error) {
       Log.w("Yingxia.Music", "Cannot load music cover; using placeholder", error);
     }

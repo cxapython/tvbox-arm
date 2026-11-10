@@ -5,6 +5,7 @@ This Android port follows the license of [tvbox-silicon / Yingxia](https://githu
 | Component | Origin | License |
 | --- | --- | --- |
 | Yingxia design, icon, script hosts and site assets | tvbox-silicon at the recorded revision | GPL-3.0-only; embedded file notices remain applicable |
+| Music catalogs, music TV layout, quality mapping and same-recording fallback | tvbox-silicon TVCore / App at 030330f; Migu/Kuwo source comments credit Zencok/baka-plugins | GPL-3.0-only; translated to Java / Android Media3 |
 | QuickJS-ng v0.17.0 | https://github.com/quickjs-ng/quickjs | MIT; see `vendor/QuickJS/LICENSE` and `UPSTREAM.md` |
 | TVScript bridge | tvbox-silicon, with Android threading/JNI adaptations | GPL-3.0-only |
 | ItaloDance radio behavior and song timing | User-authorized port of the same author's Mp4Hub ARM32 TV implementation; rewritten for this Java UI | Included under this project's GPL-3.0-only |
