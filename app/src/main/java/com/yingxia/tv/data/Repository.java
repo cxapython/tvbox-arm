@@ -120,7 +120,8 @@ public final class Repository {
   }
 
   public boolean isSourceVisible(JSONObject site) {
-    return sourceSupport.reason(site) == null
+    return site.optString("name").trim().endsWith("不卡")
+        && sourceSupport.reason(site) == null
         && !settings.getBoolean("hidden." + site.optString("id"), false);
   }
 

@@ -93,7 +93,6 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
   protected void onPause() {
     super.onPause();
     if (handoff != null) handoff.close();
-    XiaoaiBridge.detach(this);
   }
 
   @Override
@@ -107,7 +106,12 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
   @Override public void onVoiceText(String text) {
     runOnUiThread(() -> {
       String query = voiceQuery(text);
-      if (query.isEmpty() || query.equals("映匣")) return;
+      if (query.isEmpty() || query.equals("映匣") || query.equals("影子")) return;
+      bringToFront();
+      if (isFirstVoice(text)) {
+        if (!voicePlayFirstSearchResult()) toast("请先搜索影片");
+        return;
+      }
       boolean music = isMusicVoice(text);
       boolean autoplay = hasVoiceWord(text, "播放", "看", "观看", "听");
       if (music) {
@@ -119,6 +123,23 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
         searchPage(query);
       }
     });
+  }
+
+  private void bringToFront() {
+    try {
+      ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+      if (manager != null) manager.moveTaskToFront(getTaskId(), 0);
+    } catch (SecurityException ignored) {
+      // The explicit activity start below still handles normal foreground transitions.
+    }
+    startActivity(new Intent(this, MainActivity.class)
+        .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+  }
+
+  private static boolean isFirstVoice(String text) {
+    if (text == null) return false;
+    return text.contains("第一个") || text.contains("第一条") || text.contains("第一部")
+        || text.contains("第1个") || text.contains("第1条") || text.contains("第1部");
   }
 
   private void build() {
@@ -2492,8 +2513,26 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     }
     loaded();
     body.addView(text(this, "已找到：" + state.video.optString("vod_name") + "，正在准备播放…", 16, SECONDARY));
-    JSONObject site = state.site;
-    JSONObject listed = state.video;
+    prepareVoiceVideo(token, state.site, state.video);
+  }
+
+  private boolean voicePlayFirstSearchResult() {
+    if (currentPage == null || !"search".equals(currentPage.route())) return false;
+    Object data = currentPage.data();
+    if (!(data instanceof SearchSnapshot)) return false;
+    SearchSnapshot search = (SearchSnapshot) data;
+    for (SearchSnapshot.Result result : search.results()) {
+      if (result.videos.isEmpty()) continue;
+      int token = page("voiceVideo", "语音播放", Json.obj("query", search.query()),
+          () -> searchPage(search.query()));
+      body.addView(text(this, "正在播放第一条：" + result.videos.get(0).optString("vod_name"), 16, SECONDARY));
+      prepareVoiceVideo(token, result.site, result.videos.get(0));
+      return true;
+    }
+    return false;
+  }
+
+  private void prepareVoiceVideo(int token, JSONObject site, JSONObject listed) {
     async(token, () -> {
       JSONObject answer = app.engine.call(site, Json.obj("ids", listed.optString("vod_id")));
       List<JSONObject> details = Catalog.videos(answer);
@@ -2501,7 +2540,10 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
       List<JSONObject> episodes = Catalog.episodes(video);
       if (episodes.isEmpty()) throw new IOException("这个影视条目没有可播放集数");
       return app.engine.playback(site, video, episodes.get(0));
-    }, play -> PlayerActivity.open(this, play), message -> {
+    }, play -> {
+      bringToFront();
+      PlayerActivity.open(this, play);
+    }, message -> {
       toast(message);
       details(site, listed);
     });
@@ -2565,7 +2607,10 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
       List<JSONObject> songs = new MusicClient().search(query, provider, 1);
       if (songs.isEmpty()) throw new IOException("没有找到匹配的歌曲");
       return new MusicClient().play(songs.get(0), repo.settings.getString("musicQuality", MusicResolver.HIGH));
-    }, play -> MusicPlayerActivity.open(this, play), message -> {
+    }, play -> {
+      bringToFront();
+      MusicPlayerActivity.open(this, play);
+    }, message -> {
       toast(message);
       music(provider, query, 1);
     });

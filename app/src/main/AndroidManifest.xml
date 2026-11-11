@@ -7,11 +7,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
     <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
-    <application android:name=".YingxiaApp" android:label="映匣" android:icon="@drawable/app_icon"
+    <application android:name=".YingxiaApp" android:label="@string/app_name" android:icon="@drawable/app_icon"
         android:banner="@drawable/tv_banner" android:theme="@style/AppTheme"
         android:allowBackup="false" android:supportsRtl="true" android:usesCleartextTraffic="true">
         <activity android:name=".ui.MainActivity" android:screenOrientation="landscape" android:exported="true" android:launchMode="singleTask">
@@ -34,7 +35,7 @@
         <activity android:name=".ui.MusicPlayerActivity" android:screenOrientation="landscape" android:exported="false" />
         <activity android:name=".ui.RadioActivity" android:screenOrientation="landscape" android:exported="false" />
         <service android:name=".ui.XiaoaiDismissService"
-            android:label="映匣小爱桥接"
+            android:label="影子小爱桥接"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>
