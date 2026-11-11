@@ -429,6 +429,12 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
       assertTrue(forward.getDrawable() instanceof android.graphics.drawable.VectorDrawable);
       assertTrue(rewind.getContentDescription().toString().contains("快退"));
       assertTrue(forward.getContentDescription().toString().contains("快进"));
+      assertEquals(
+          android.view.View.GONE,
+          player.getWindow().getDecorView().findViewById(androidx.media3.ui.R.id.exo_basic_controls)
+              .getVisibility());
+      assertNull(
+          player.getWindow().getDecorView().findViewById(androidx.media3.ui.R.id.exo_minimal_controls));
     } finally {
       if (player != null) {
         PlayerActivity target = player;

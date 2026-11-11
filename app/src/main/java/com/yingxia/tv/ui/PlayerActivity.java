@@ -102,7 +102,8 @@ public final class PlayerActivity extends Activity {
     view.setControllerShowTimeoutMs(5000);
     view.setShowNextButton(true);
     view.setShowPreviousButton(true);
-    view.setShowSubtitleButton(true);
+    // Subtitle and playback options are exposed through the custom action row below.
+    view.setShowSubtitleButton(false);
     root.addView(view, new FrameLayout.LayoutParams(-1, -1));
     LinearLayout chrome = vertical(this);
     pad(chrome, 30, 18);
