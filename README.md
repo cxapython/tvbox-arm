@@ -45,6 +45,20 @@ ItaloDance 不依赖影视订阅，入口为「音乐 → ItaloDance 电台」�
 
 「音乐」中可搜索 GD／网易云、QQ、酷我和咪咕。GD／网易云与 QQ 另提供榜单、推荐歌单、新专辑以及歌单／专辑搜索；打开歌单后可连续播放、切换歌曲。
 
+映匣也支持外部语音桥接启动音乐搜索。搜索并进入音乐结果页：
+
+```text
+yingxia://music/search?query=周杰伦%20晴天
+```
+
+搜索并自动播放第一条结果：
+
+```text
+yingxia://music/search?query=周杰伦%20晴天&autoplay=true
+```
+
+可选 `source` 参数为 `netease`、`tencent`、`kuwo`、`migu`、`kugou` 或 `musify`。也支持通过 `android.intent.action.SEARCH` 传入 `SearchManager.QUERY`，以及使用 `com.yingxia.tv.action.SEARCH_MUSIC` 搭配 `query` extra。
+
 新增 **Musify**：可搜索歌曲、歌手，或粘贴 Musify 歌手页链接浏览歌曲。点按结果播放，长按选择收藏或下载；下载完成后从「下载」离线播放。使用公开音频流，无需配置账号，音质以站点原始文件和实际解码结果为准。接入范围与验证见 [Musify 适配记录](docs/MUSIFY.md)。
 
 音乐播放器参考原版 tvOS 的封面、取色模糊背景和同步歌词布局，用 Android 原生视图与 Media3 重新实现；Apple 的 SwiftUI／AVKit 控件没有直接迁入，也未逐像素复刻。点歌曲进入独立播放器，左上角「返回」回到原搜索列表。支持遥控器暂停、上一首／下一首、进度调整、歌词开关、音质切换及收藏。
@@ -61,6 +75,34 @@ adb install -r artifacts/yingxia-tv-arm32.apk
 ```
 
 打开电视桌面上的「映匣」。应用注册了 Android TV 桌面入口，不要求触摸屏。
+
+### 小米电视小爱语音桥接
+
+`MiTV-MTEQ0` 的遥控器语音键不产生普通 Android 按键事件，映匣会读取小爱识别完成后写入的 `logcat` 文本。安装后首次配置：
+
+完整的实机安装、日志检查和语音测试步骤见 [小爱语音测试指南](docs/XIAOAI_VOICE_TEST.md)。
+
+```sh
+adb shell pm grant com.yingxia.tv android.permission.READ_LOGS
+```
+
+然后在电视的「设置 → 无障碍」中启用「映匣小爱桥接」，并重新打开映匣。验证日志：
+
+```sh
+adb logcat -c
+adb logcat -v raw -T 1 -e onConversationFinished
+```
+
+可用语句：
+
+```text
+小爱同学，打开映匣
+小爱同学，搜索电影 流浪地球
+小爱同学，播放电视剧 狂飙
+小爱同学，播放歌曲 周杰伦 晴天
+```
+
+仅说「搜索」会进入结果页；说「播放」或「看」会尝试打开第一条可播放结果。桥接只在映匣前台运行，不会持续录音，也不会在电视上运行大模型。
 
 | 遥控操作 | 功能 |
 |---|---|

@@ -1,3 +1,4 @@
 <resources>
     <string name="download_channel">离线下载</string>
+    <string name="xiaoai_dismiss_description">关闭小爱语音结果弹窗</string>
 </resources>

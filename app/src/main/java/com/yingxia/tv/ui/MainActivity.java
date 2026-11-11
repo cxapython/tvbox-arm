@@ -23,7 +23,7 @@ import java.util.function.Consumer;
 import org.json.*;
 
 /** Android rendering of RootView, WatchNowTV, SiteView, LiveView and their shared TV design. */
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements XiaoaiBridge.Target {
   private static WeakReference<MainActivity> active = new WeakReference<>(null);
 
   public static MainActivity current() {
@@ -45,6 +45,14 @@ public final class MainActivity extends Activity {
   private final List<TextView> nav = new ArrayList<>();
   private boolean expanded = false;
   private HandoffServer handoff;
+  private static final class VoiceVideoSearch {
+    int remaining;
+    int score = -1;
+    JSONObject site;
+    JSONObject video;
+
+    VoiceVideoSearch(int remaining) { this.remaining = remaining; }
+  }
   private static final String[] TITLES = {
     "现在观看", "发现", "直播", "音乐", "全局搜索", "点播源", "播放历史", "收藏", "下载", "设置"
   };
@@ -78,19 +86,39 @@ public final class MainActivity extends Activity {
     active = new WeakReference<>(this);
     if (handoff == null) handoff = new HandoffServer(this);
     handoff.start();
+    XiaoaiBridge.attach(this);
   }
 
   @Override
   protected void onPause() {
     super.onPause();
     if (handoff != null) handoff.close();
+    XiaoaiBridge.detach(this);
   }
 
   @Override
   protected void onDestroy() {
     generation++;
+    XiaoaiBridge.detach(this);
     if (current() == this) active.clear();
     super.onDestroy();
+  }
+
+  @Override public void onVoiceText(String text) {
+    runOnUiThread(() -> {
+      String query = voiceQuery(text);
+      if (query.isEmpty() || query.equals("映匣")) return;
+      boolean music = isMusicVoice(text);
+      boolean autoplay = hasVoiceWord(text, "播放", "看", "观看", "听");
+      if (music) {
+        handleMusicVoice(query, autoplay, null);
+      } else if (autoplay) {
+        voiceSearchVideo(query);
+      } else {
+        select(4);
+        searchPage(query);
+      }
+    });
   }
 
   private void build() {
@@ -2345,8 +2373,20 @@ public final class MainActivity extends Activity {
           });
       return;
     }
+    if (Intent.ACTION_SEARCH.equals(intent.getAction())
+        || "com.yingxia.tv.action.SEARCH_MUSIC".equals(intent.getAction())) {
+      String query = intent.getStringExtra(SearchManager.QUERY);
+      if (query == null) query = intent.getStringExtra("query");
+      handleMusicVoice(query, intent.getBooleanExtra("autoplay", false), intent.getStringExtra("source"));
+      return;
+    }
     Uri uri = intent.getData();
     if (uri == null || !"yingxia".equalsIgnoreCase(uri.getScheme())) return;
+    if ("music".equalsIgnoreCase(uri.getHost()) && "/search".equalsIgnoreCase(uri.getPath())) {
+      handleMusicVoice(uri.getQueryParameter("query"), isTrue(uri.getQueryParameter("autoplay")),
+          uri.getQueryParameter("source"));
+      return;
+    }
     final JSONObject link;
     try {
       link = SubscriptionLink.parse(uri.toString());
@@ -2370,6 +2410,168 @@ public final class MainActivity extends Activity {
               },
               x -> select(0));
         });
+  }
+
+  private void handleMusicVoice(String query, boolean autoplay, String source) {
+    String value = query == null ? "" : query.trim();
+    if (value.isEmpty()) {
+      select(3);
+      toast("没有收到歌曲名称");
+      return;
+    }
+    String provider = musicProvider(source);
+    if (autoplay) {
+      select(3);
+      voiceSearchMusic(provider, value);
+    } else {
+      select(3);
+      music(provider, value, 1);
+    }
+  }
+
+  private void voiceSearchVideo(String query) {
+    int token = page("voiceVideo", "语音播放", Json.obj("query", query),
+        () -> voiceSearchVideo(query));
+    body.addView(text(this, "正在搜索并准备播放：" + query, 16, SECONDARY));
+    List<JSONObject> sites = new ArrayList<>();
+    for (JSONObject site : repo.sites())
+      if (repo.isSourceVisible(site) && !Catalog.isIndex(site)) sites.add(site);
+    if (sites.isEmpty()) {
+      toast("没有可搜索的影视源");
+      searchPage(query);
+      return;
+    }
+    loading();
+    VoiceVideoSearch state = new VoiceVideoSearch(sites.size());
+    for (JSONObject site : sites) {
+      app.io.execute(() -> {
+        JSONObject best = null;
+        int bestScore = -1;
+        try {
+          List<JSONObject> videos = Catalog.videos(app.engine.call(site, Json.obj("wd", query, "pg", "1")));
+          for (JSONObject video : TitleMatch.ordered(videos, query, v -> v.optString("vod_name"))) {
+            int score = voiceVideoScore(query, video.optString("vod_name"));
+            if (score > bestScore) {
+              best = video;
+              bestScore = score;
+            }
+          }
+        } catch (Exception error) {
+          android.util.Log.d("Yingxia.Voice", "voice video search failed", error);
+        }
+        boolean done;
+        synchronized (state) {
+          if (best != null && bestScore > state.score) {
+            state.score = bestScore;
+            state.site = site;
+            state.video = best;
+          }
+          state.remaining--;
+          done = state.remaining == 0;
+        }
+        if (done) runOnUiThread(() -> finishVoiceVideo(token, query, state));
+      });
+    }
+  }
+
+  private void finishVoiceVideo(int token, String query, VoiceVideoSearch state) {
+    if (generation != token || isFinishing()) return;
+    if (state.site == null || state.video == null) {
+      toast("没有找到可播放的影视内容");
+      searchPage(query);
+      return;
+    }
+    loaded();
+    body.addView(text(this, "已找到：" + state.video.optString("vod_name") + "，正在准备播放…", 16, SECONDARY));
+    JSONObject site = state.site;
+    JSONObject listed = state.video;
+    async(token, () -> {
+      JSONObject answer = app.engine.call(site, Json.obj("ids", listed.optString("vod_id")));
+      List<JSONObject> details = Catalog.videos(answer);
+      JSONObject video = details.isEmpty() ? listed : details.get(0);
+      List<JSONObject> episodes = Catalog.episodes(video);
+      if (episodes.isEmpty()) throw new IOException("这个影视条目没有可播放集数");
+      return app.engine.playback(site, video, episodes.get(0));
+    }, play -> PlayerActivity.open(this, play), message -> {
+      toast(message);
+      details(site, listed);
+    });
+  }
+
+  private static int voiceVideoScore(String query, String title) {
+    String q = voiceNormalize(query), t = voiceNormalize(title);
+    if (q.isEmpty() || t.isEmpty()) return 0;
+    if (q.equals(t)) return 1000;
+    if (t.contains(q)) return 800;
+    if (q.contains(t)) return 700;
+    return 100;
+  }
+
+  private static boolean isMusicVoice(String text) {
+    return hasVoiceWord(text, "歌曲", "音乐", "听歌", "歌手", "专辑", "歌词");
+  }
+
+  private static boolean hasVoiceWord(String text, String... words) {
+    if (text == null) return false;
+    for (String word : words) if (text.contains(word)) return true;
+    return false;
+  }
+
+  private static String voiceQuery(String text) {
+    String value = text == null ? "" : text.trim();
+    String[] prefixes = {
+        "小爱同学", "小爱", "播放一下", "搜索一下", "搜一下", "查找一下", "打开一下",
+        "请你", "请", "帮我", "给我", "我要", "播放", "搜索", "搜", "查找", "找一下",
+        "找", "打开", "观看", "看一下", "看", "听一下", "听"
+    };
+    boolean changed;
+    do {
+      changed = false;
+      value = value.replaceFirst("^[，,。.!！、:：\\s]+", "");
+      for (String prefix : prefixes) {
+        if (value.startsWith(prefix)) {
+          value = value.substring(prefix.length());
+          changed = true;
+          break;
+        }
+      }
+    } while (changed);
+    for (String kind : new String[] {"歌曲", "音乐", "电影", "电视剧", "电视", "影片", "连续剧"}) {
+      if (value.startsWith(kind)) value = value.substring(kind.length());
+    }
+    return value.replaceFirst("^[，,。.!！、:：\\s]+", "").trim();
+  }
+
+  private static String voiceNormalize(String value) {
+    return value == null ? "" : value.toLowerCase(Locale.ROOT)
+        .replaceAll("[\\p{P}\\p{S}\\s]+", "");
+  }
+
+  private void voiceSearchMusic(String provider, String query) {
+    int token = page("voiceMusic", "语音播放", Json.obj("provider", provider, "query", query),
+        () -> voiceSearchMusic(provider, query));
+    body.addView(text(this, "正在搜索并准备播放：" + query, 16, SECONDARY));
+    loading();
+    async(token, () -> {
+      List<JSONObject> songs = new MusicClient().search(query, provider, 1);
+      if (songs.isEmpty()) throw new IOException("没有找到匹配的歌曲");
+      return new MusicClient().play(songs.get(0), repo.settings.getString("musicQuality", MusicResolver.HIGH));
+    }, play -> MusicPlayerActivity.open(this, play), message -> {
+      toast(message);
+      music(provider, query, 1);
+    });
+  }
+
+  private static boolean isTrue(String value) {
+    return "1".equals(value) || "true".equalsIgnoreCase(value) || "yes".equalsIgnoreCase(value)
+        || "on".equalsIgnoreCase(value);
+  }
+
+  private static String musicProvider(String value) {
+    if (value == null) return "netease";
+    String provider = value.trim().toLowerCase(Locale.ROOT);
+    return Arrays.asList("netease", "tencent", "qq", "kuwo", "migu", "kugou", "musify").contains(provider)
+        ? provider : "netease";
   }
 
   private EditText edit(String hint, String value) {

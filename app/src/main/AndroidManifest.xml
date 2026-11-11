@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -6,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.hardware.wifi" android:required="false" />
@@ -22,10 +24,24 @@
                 <action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.DEFAULT" /><category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="yingxia" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEARCH" />
+                <action android:name="com.yingxia.tv.action.SEARCH_MUSIC" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
         <activity android:name=".ui.PlayerActivity" android:screenOrientation="landscape" android:exported="false" android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
         <activity android:name=".ui.MusicPlayerActivity" android:screenOrientation="landscape" android:exported="false" />
         <activity android:name=".ui.RadioActivity" android:screenOrientation="landscape" android:exported="false" />
+        <service android:name=".ui.XiaoaiDismissService"
+            android:label="映匣小爱桥接"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/xiaoai_dismiss_service" />
+        </service>
         <service android:name=".data.OfflineService" android:foregroundServiceType="dataSync" android:exported="false" />
     </application>
 </manifest>
