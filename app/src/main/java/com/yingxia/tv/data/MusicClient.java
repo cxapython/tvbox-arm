@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import org.json.*;
 
-/** Catalog search plus ordered Migu/Kuwo/QQ/NetEase/LX playback resolvers. */
+/** Catalog search plus ordered domestic, Audius, Musify and LX playback resolvers. */
 public final class MusicClient {
   private final YingxiaApp app = YingxiaApp.get();
   private final Http http = app.http;
@@ -18,6 +18,8 @@ public final class MusicClient {
   public final GdMusicCatalog gd = new GdMusicCatalog(this::musicJson);
   public final NativeMusicCatalog nativeCatalog = new NativeMusicCatalog(this::catalogJson);
   public final MusifyCatalog musify = new MusifyCatalog(this::musifyText);
+  public final AudiusCatalog audius = new AudiusCatalog(this::audiusText);
+  public final JamendoCatalog jamendo = new JamendoCatalog(this::audiusText);
 
   private String musifyText(String url) throws Exception {
     Http.Result response = http.request(url, "GET",
@@ -26,6 +28,13 @@ public final class MusicClient {
         null, 3_000_000, true, 15000);
     if (response.status < 200 || response.status >= 300)
       throw new IOException(MusifyCatalog.errorMessage(response.status, response.text()));
+    return response.text();
+  }
+
+  private String audiusText(String url) throws Exception {
+    Http.Result response = http.request(url, "GET", Http.params("Accept", "application/json"),
+        null, 4_000_000, true, 15000);
+    Http.check(response);
     return response.text();
   }
 
@@ -50,6 +59,8 @@ public final class MusicClient {
       case "migu": return "咪咕音乐";
       case "kugou": return "酷狗音乐";
       case "musify": return "Musify";
+      case "audius": return "Audius · 电子舞曲";
+      case "jamendo": return "Jamendo · 独立电子音乐";
       default: return "音乐";
     }
   }
@@ -91,6 +102,8 @@ public final class MusicClient {
 
   public List<JSONObject> search(String query, String source, int page) throws Exception {
     if (source.equals("musify")) return Json.objects(musify.searchPage(query, page).getJSONArray("items"));
+    if (source.equals("audius")) return audius.search(query, page);
+    if (source.equals("jamendo")) return jamendo.search(query, page);
     if (source.equals("netease")) return gd.search(query, page);
     if (Arrays.asList("tencent", "qq", "migu", "kuwo").contains(source)) return nativeCatalog.search(source, query, page);
     String url =
@@ -138,7 +151,9 @@ public final class MusicClient {
 
   public JSONObject play(JSONObject song, String quality) throws Exception {
     String normalized = MusicResolver.normalizeQuality(quality);
-    if (song.optString("source").equals("musify")) return playDirect(song, normalized);
+    if (song.optString("source").equals("musify") || song.optString("source").equals("audius")
+        || song.optString("source").equals("jamendo"))
+      return playDirect(song, normalized);
     try {
       return playDirect(song, normalized);
     } catch (Exception first) {
@@ -181,7 +196,8 @@ public final class MusicClient {
 
   public JSONObject lyricData(JSONObject song) throws Exception {
     String source = song.optString("source");
-    if (source.equals("musify")) return Json.obj("lyric", "", "translation", "");
+    if (source.equals("musify") || source.equals("audius") || source.equals("jamendo"))
+      return Json.obj("lyric", "", "translation", "");
     String catalog = song.optString("catalogSource");
     if (catalog.equals("tencent") || catalog.equals("qq")) return nativeCatalog.lyrics(song.optString("catalogSongId"));
     if (catalog.equals("netease")) return gd.lyric(song.optString("catalogSongId"));
@@ -225,6 +241,8 @@ public final class MusicClient {
 
   private List<MusicResolver.Provider> providers(String platform) {
     if (platform.equals("musify")) return Collections.singletonList(provider("Musify", musify::resolve));
+    if (platform.equals("audius")) return Collections.singletonList(provider("Audius", audius::resolve));
+    if (platform.equals("jamendo")) return Collections.singletonList(provider("Jamendo", jamendo::resolve));
     List<MusicResolver.Provider> out = new ArrayList<>();
     switch (sourceKey(platform)) {
       case "mg":

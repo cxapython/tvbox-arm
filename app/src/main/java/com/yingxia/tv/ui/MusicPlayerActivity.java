@@ -504,6 +504,8 @@ public final class MusicPlayerActivity extends Activity {
       case "nianxin": source = "念心音源 · " + MusicClient.platformName(play.optString("source")); break;
       case "vkeys": source = "VKeys · QQ 音乐"; break;
       case "migu": source = "咪咕音乐"; break;
+      case "audius": source = "Audius · 电子舞曲"; break;
+      case "jamendo": source = "Jamendo · 独立电子音乐"; break;
       default: source = MusicClient.platformName(play.optString("source"));
     }
     if (play.optBoolean("sourceFallback")) source += " · 已切换音源";

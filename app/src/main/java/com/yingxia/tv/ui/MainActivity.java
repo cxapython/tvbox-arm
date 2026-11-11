@@ -1725,7 +1725,8 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     LinearLayout platforms = actions();
     String[][] options = {
       {"netease", "GD 音乐台 · 网易云"}, {"tencent", "QQ 音乐"}, {"kuwo", "酷我音乐"},
-      {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}, {"musify", "Musify"}
+      {"migu", "咪咕音乐"}, {"kugou", "酷狗音乐"}, {"musify", "Musify"},
+      {"audius", "Audius · Hardstyle / ItaloDance"}, {"jamendo", "Jamendo · 独立电子音乐"}
     };
     for (String[] p : options) {
       TextView platform = button(this, (p[0].equals(provider) ? "✓ " : "") + p[1], () -> music(p[0], query, 1));
@@ -1743,7 +1744,7 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     LinearLayout controls = actions();
     String quality = MusicResolver.normalizeQuality(repo.settings.getString("musicQuality", MusicResolver.HIGH));
     String qualityLabel = quality.equals(MusicResolver.FLAC) ? "FLAC 无损" : quality + " kbps";
-    if (!provider.equals("musify")) spaced(controls, button(this, "优先音质：" + qualityLabel, () -> new AlertDialog.Builder(this)
+    if (!provider.equals("musify") && !provider.equals("audius") && !provider.equals("jamendo")) spaced(controls, button(this, "优先音质：" + qualityLabel, () -> new AlertDialog.Builder(this)
         .setTitle("音乐音质")
         .setItems(new String[] {"FLAC 无损", "320 kbps", "128 kbps"}, (dialog, selected) -> {
           repo.settings.edit().putString("musicQuality", selected == 0 ? MusicResolver.FLAC : selected == 1 ? MusicResolver.HIGH : MusicResolver.STANDARD).apply();
@@ -1760,6 +1761,14 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     }
     if (provider.equals("musify")) {
       body.addView(text(this, "Musify · 站点原始音质 · 点按播放，长按收藏或下载", 12, SECONDARY));
+      gap(body, 12);
+    }
+    if (provider.equals("audius")) {
+      body.addView(text(this, "Audius · 海外公开电子音乐流 · 原始音质 · 需要电视可访问海外网络", 12, SECONDARY));
+      gap(body, 12);
+    }
+    if (provider.equals("jamendo")) {
+      body.addView(text(this, "Jamendo · 独立音乐与 Creative Commons 曲目 · 原始音质", 12, SECONDARY));
       gap(body, 12);
     }
     LinearLayout row = horizontal(this);
@@ -2570,7 +2579,7 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
   private static String musicProvider(String value) {
     if (value == null) return "netease";
     String provider = value.trim().toLowerCase(Locale.ROOT);
-    return Arrays.asList("netease", "tencent", "qq", "kuwo", "migu", "kugou", "musify").contains(provider)
+    return Arrays.asList("netease", "tencent", "qq", "kuwo", "migu", "kugou", "musify", "audius", "jamendo").contains(provider)
         ? provider : "netease";
   }
 
