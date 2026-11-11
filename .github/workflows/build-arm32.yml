@@ -95,3 +95,50 @@ jobs:
       - name: Remove signing key
         if: always()
         run: rm -f "$RUNNER_TEMP/yingxia-signing.keystore"
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download verified ARM32 APK
+        uses: actions/download-artifact@v4
+        with:
+          name: yingxia-tv-arm32-${{ github.sha }}
+          path: release-artifact
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version_name="$(sed -n "s/.*versionName ['\"]\([^'\"]*\)['\"].*/\1/p" app/build.gradle | head -n 1)"
+          if [[ -z "$version_name" ]]; then
+            echo "Unable to read versionName from app/build.gradle" >&2
+            exit 1
+          fi
+          tag="v${version_name}"
+          apk="$(find release-artifact -type f -name 'yingxia-tv-arm32.apk' -print -quit)"
+          sums="$(find release-artifact -type f -name 'SHA256SUMS' -print -quit)"
+          if [[ -z "$apk" || -z "$sums" ]]; then
+            echo "Verified APK or checksum artifact is missing" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Release tag already exists: $tag" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$GITHUB_SHA" -m "Release $tag"
+          git push origin "$tag"
+          gh release create "$tag" "$apk" "$sums" \
+            --title "$tag" \
+            --generate-notes
