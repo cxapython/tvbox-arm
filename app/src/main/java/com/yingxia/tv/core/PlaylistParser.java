@@ -51,6 +51,10 @@ public final class PlaylistParser {
         group = attribute(line, "group-title", group);
         logo = attribute(line, "tvg-logo", "");
         headers = new LinkedHashMap<>(defaults);
+        String agent = attribute(line, "http-user-agent", "");
+        String referrer = attribute(line, "http-referrer", attribute(line, "http-referer", ""));
+        if (!agent.isEmpty()) headers.put("User-Agent", agent);
+        if (!referrer.isEmpty()) headers.put("Referer", referrer);
       } else if (line.startsWith("#EXTGRP:")) group = line.substring(8).trim();
       else if (line.startsWith("#EXTVLCOPT:")) {
         String[] parts = line.substring(11).split("=", 2);

@@ -2,18 +2,27 @@
 
 **为小米电视、Android TV 和 ARM32 电视盒子打造的原生影音应用。** 横屏大屏布局、方向键焦点导航和遥控器播放操作，基于 [tvbox-silicon / 映匣](https://github.com/jo32/tvbox-silicon) 移植，使用 Java、QuickJS 与 AndroidX Media3。
 
-当前版本：`1.8.15-android.4-tv`。最低 Android 5.0 / API 21。电视安装包仅包含 `armeabi-v7a` 原生库。
+当前版本：`1.8.15-android.5-tv`。最低 Android 5.0 / API 21。电视安装包仅包含 `armeabi-v7a` 原生库。
 
 ## 电视上能做什么
 
 - **电影与电视剧**：片库、分类筛选、分页、全局搜索、详情选集、续播、历史和收藏；网页线路支持交互式 JS/重定向/人工验证码后自动嗅探播放地址。
-- **遥控器播放**：暂停、跳转、选集、清晰度、音轨和字幕、倍速、画面比例、跳过片头片尾。
-- **电视直播**：M3U / TXT / TVBox 直播订阅，频道分组和换台。
+- **遥控器播放**：暂停、跳转、选集、清晰度、音轨和字幕、倍速、画面比例、跳过片头片尾；快进步长可设置，按语言/名称保持音轨字幕偏好，下一集提前解析可关闭。
+- **电视直播**：M3U / TXT / TVBox 直播订阅，频道分组和换台；同频道备用线路归并、失败或长时间缓冲后自动切线，兼容 EXTINF 指定的 UA / Referer。
 - **音乐与电台**：GD／网易云、QQ、酷我、咪咕音乐；独立音乐播放页、封面背景、同步歌词、歌单队列与实际音质显示；内置 **ItaloDance Radio**，高／低音质切换、实时歌名与歌手、专辑封面背景、歌曲进度和断流切线。
 - **离线下载**：下载队列、本地缓存和离线读取。
+- **应用内更新**：启动每天自动检查本项目的正式 Release，可关闭；应用内下载、进度和安全校验后打开系统安装器，无需反复用 U 盘传包，仍需系统确认。
 - **手机辅助输入**：同一网络下通过手机输入订阅地址，支持备份导入导出。
 
 不提供漫画、网盘和媒体服务器功能。未适配或已确认不可用的源会隐藏，原始订阅和历史数据仍保留。
+
+## 应用内更新
+
+「设置 → 应用更新 → 检查更新」可查看版本说明、下载和安装。默认启动后每天检查一次，检查失败不影响播放。点击“下载并更新”后，下载由系统在后台继续；页面前台下载完成并校验通过时会打开安装流程，也可稍后回来选择“安装更新”。
+
+普通 Android 应用不能保证静默覆盖安装：**电视系统仍需确认安装**，Android 8+ 首次可能需要允许映匣安装未知应用。旧版本没有更新入口，所以本版仍需先安装一次；前提是签名一致。更新不会主动卸载旧应用或清空资料。
+
+线上更新包必须来自**本项目**的正式 Release，包含匹配的 `update.json`，并使用与已安装应用相同的签名。缺少固定签名时 CI 只生成验证 APK，不发布应用更新。部署、签名衔接和验证边界见 [应用更新说明](docs/APP_UPDATES.md)。
 
 ## 默认订阅与内置电台
 
@@ -130,15 +139,15 @@ export ANDROID_HOME=/你的/Android/sdk
 ./scripts/build-arm32.sh
 ```
 
-输出：`artifacts/yingxia-tv-arm32.apk`，校验和：`artifacts/SHA256SUMS`。默认使用本机 Android 开发签名，自用覆盖升级请保留同一份签名。构建不会自动修改或拉取上游源码，移植基线记录在 [SOURCE_REVISION](docs/SOURCE_REVISION)。
+输出：`artifacts/yingxia-tv-arm32.apk`，更新描述：`artifacts/update.json`，校验和：`artifacts/SHA256SUMS`（在 artifacts 目录执行校验）。默认使用本机 Android 开发签名，自用覆盖升级请保留同一份签名。构建不会自动修改或拉取上游源码，移植基线记录在 [SOURCE_REVISION](docs/SOURCE_REVISION)。
 
 ### GitHub 自动打包
 
 推送到 `main`、推送 `v*` 标签、向 `main` 提交 PR，或在 GitHub Actions 手动运行 **Build ARM32 APK**，均会自动执行单元测试、Lint、ARM32 release 构建、签名及 ELF 校验。
 
-在仓库 **Actions → Build ARM32 APK → 对应运行 → Artifacts** 下载 `yingxia-tv-arm32-提交SHA`，解压得到 `yingxia-tv-arm32.apk` 和 `SHA256SUMS`。APK 保存 30 天，测试报告保存 14 天。
+在仓库 **Actions → Build ARM32 APK → 对应运行 → Artifacts** 下载 `yingxia-tv-arm32-提交SHA`，解压得到 `yingxia-tv-arm32.apk` 、`SHA256SUMS` 和 `update.json`。APK 保存 30 天，测试报告保存 14 天。
 
-无需配置即可构建安装包。默认使用本次运行临时生成的开发签名；不同运行及本地构建的签名可能不同，不能保证覆盖安装。需要固定签名以保留数据覆盖升级时，在仓库 **Settings → Secrets and variables → Actions** 配置：
+无需配置即可构建验证安装包，但临时签名包不会自动发布为正式 Release。要启用正式发布和应用内更新，必须使用固定签名；不同签名不能覆盖安装。在仓库 **Settings → Secrets and variables → Actions** 配置：
 
 | Secret | 内容 |
 | --- | --- |
@@ -146,6 +155,9 @@ export ANDROID_HOME=/你的/Android/sdk
 | `ANDROID_KEY_ALIAS` | 密钥别名；本地默认开发签名为 `androiddebugkey` |
 | `ANDROID_STORE_PASSWORD` | keystore 密码；开发签名默认 `android` |
 | `ANDROID_KEY_PASSWORD` | 密钥密码；开发签名默认 `android` |
+| `ANDROID_CERT_SHA256` | 可选：期望的证书 SHA-256 指纹，防止误换签名 |
+
+新版本须同时增加 `app/build.gradle` 的 `versionCode` 和 `versionName`。已发布的同一版本再次推送只构建验证、跳过发布，不覆盖原标签和附件；未发布完整的同提交草稿可重试。
 
 使用与现有安装包相同的 keystore 才能覆盖升级。PR 构建始终使用临时开发签名。签名文件仅在 runner 临时目录中使用，不进入仓库或构建产物。
 

@@ -42,4 +42,17 @@ public class PlaylistParserTest {
     assertEquals("hello world", header.optString("X-Good"));
     assertEquals("default", header.optString("X-Default"));
   }
+  @Test public void extinfHeadersApplyOnlyToThatEntryAndVlcoptOverrides() {
+    String playlist = "#EXTM3U\n#EXTINF:-1 http-user-agent=\"Aptv-UA\" http-referer=\"https://origin/\",One\n"
+        + "https://example.com/1.m3u8\n"
+        + "#EXTINF:-1 http-user-agent=\"Entry-UA\",Two\n#EXTVLCOPT:http-user-agent=Override-UA\n"
+        + "https://example.com/2.m3u8\n#EXTINF:-1,Three\nhttps://example.com/3.m3u8";
+    java.util.List<JSONObject> channels = PlaylistParser.parse(playlist, "https://example.com/list", Map.of("User-Agent", "Default"));
+    assertEquals("Aptv-UA", Json.child(channels.get(0), "header").optString("User-Agent"));
+    assertEquals("https://origin/", Json.child(channels.get(0), "header").optString("Referer"));
+    assertEquals("Override-UA", Json.child(channels.get(1), "header").optString("User-Agent"));
+    assertEquals("Default", Json.child(channels.get(2), "header").optString("User-Agent"));
+    assertFalse(Json.child(channels.get(2), "header").has("Referer"));
+  }
+
 }

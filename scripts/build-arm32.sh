@@ -6,6 +6,7 @@ cd "$project_dir"
 # updating the Apple upstream is a separate migration, not a build-time side effect.
 sdk_dir=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-"$HOME/Library/Android/sdk"}}
 build_tools="$sdk_dir/build-tools/34.0.0"
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ./gradlew testDebugUnitTest lintDebug assembleRelease
 mkdir -p artifacts
 signing_key=${YINGXIA_SIGNING_KEY:-"$HOME/.android/debug.keystore"}
@@ -23,5 +24,7 @@ export YINGXIA_STORE_PASSWORD YINGXIA_KEY_PASSWORD
     app/build/outputs/apk/release/app-release-unsigned.apk
 "$build_tools/apksigner" verify --verbose artifacts/yingxia-tv-arm32.apk
 python3 scripts/verify_apk.py artifacts/yingxia-tv-arm32.apk
-shasum -a 256 artifacts/yingxia-tv-arm32.apk > artifacts/SHA256SUMS
+python3 scripts/make-update-manifest.py artifacts/yingxia-tv-arm32.apk \
+    --build-tools "$build_tools" --notes docs/RELEASE_NOTES.md --output artifacts/update.json
+(cd artifacts && shasum -a 256 yingxia-tv-arm32.apk update.json > SHA256SUMS)
 echo '已生成 artifacts/yingxia-tv-arm32.apk'

@@ -197,7 +197,7 @@ public final class MusicClient {
   public JSONObject lyricData(JSONObject song) throws Exception {
     String source = song.optString("source");
     if (source.equals("musify") || source.equals("audius") || source.equals("jamendo"))
-      return Json.obj("lyric", "", "translation", "");
+      return companionLyrics(song);
     String catalog = song.optString("catalogSource");
     if (catalog.equals("tencent") || catalog.equals("qq")) return nativeCatalog.lyrics(song.optString("catalogSongId"));
     if (catalog.equals("netease")) return gd.lyric(song.optString("catalogSongId"));
@@ -206,15 +206,27 @@ public final class MusicClient {
     if (source.equals("migu") || source.equals("kuwo")) {
       // TVCore loads lyrics from a matching NetEase/QQ recording. Never use just the title:
       // artist and duration must agree, otherwise show no lyrics rather than another version.
-      for (JSONObject match : gd.search(song.optString("name") + " " + song.optString("artist"), 1))
-        if (sameRecording(song, match)) return gd.lyric(match.optString("songId"));
-      return Json.obj("lyric", "", "translation", "");
+      return companionLyrics(song);
     }
     Object result = musicJson(GdMusicCatalog.API, Http.params("types", "lyric", "source",
         song.optString("source"), "id", song.optString("lyricId", song.optString("songId"))), 6000);
     if (!(result instanceof JSONObject)) throw new IOException("歌词返回格式无效");
     JSONObject json = (JSONObject) result;
     return Json.obj("lyric", json.optString("lyric"), "translation", json.optString("tlyric"));
+  }
+
+  private JSONObject companionLyrics(JSONObject song) {
+    if (song.optString("name").isEmpty() || song.optString("artist").isEmpty() || song.optLong("duration") <= 0)
+      return MusicCompanionLyrics.empty();
+    return MusicCompanionLyrics.find(song, Arrays.asList(
+        new MusicCompanionLyrics.Catalog() {
+          public List<JSONObject> search(String query) throws Exception { return nativeCatalog.search("tencent", query, 1); }
+          public JSONObject lyrics(JSONObject candidate) throws Exception { return nativeCatalog.lyrics(candidate.optString("songId")); }
+        },
+        new MusicCompanionLyrics.Catalog() {
+          public List<JSONObject> search(String query) throws Exception { return gd.search(query, 1); }
+          public JSONObject lyrics(JSONObject candidate) throws Exception { return gd.lyric(candidate.optString("songId")); }
+        }));
   }
 
   private static boolean sameRecording(JSONObject a, JSONObject b) {

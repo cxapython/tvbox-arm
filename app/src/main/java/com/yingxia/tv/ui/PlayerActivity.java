@@ -21,6 +21,7 @@ import com.yingxia.tv.data.*;
 import java.io.*;
 import java.lang.ref.WeakReference;
 import java.util.*;
+import java.util.concurrent.*;
 import org.json.*;
 
 @androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
@@ -40,10 +41,15 @@ public final class PlayerActivity extends Activity {
   private TextView title, subtitle;
   private MusicLyrics lyrics;
   private boolean seekingNext = false, released = false;
-  private boolean resumeWhenForeground;
+  private boolean resumeWhenForeground = true, foreground;
   private boolean recoveryScheduled, progressErrorShown;
   private int operationGeneration;
   private Runnable retry;
+  private final Set<String> failedLiveLines = new HashSet<>();
+  private long liveBufferingSince;
+  private boolean audioChoiceApplied, subtitleChoiceApplied;
+  private final NextEpisodePrefetch<JSONObject> nextAhead = new NextEpisodePrefetch<>();
+  private final ExecutorService nextResolver = Executors.newSingleThreadExecutor(r -> new Thread(r, "yingxia-next"));
   private PlaybackRecovery recovery = new PlaybackRecovery();
   private EpisodeSkip.Pass skipPass = new EpisodeSkip.Pass(java.util.Collections.emptyList());
 
@@ -120,7 +126,7 @@ public final class PlayerActivity extends Activity {
     LinearLayout actions = horizontal(this);
     pad(actions, 24, 10);
     spaced(actions, button(this, "返回", this::finish), 8);
-    spaced(actions, button(this, "选集", this::episodes), 8);
+    spaced(actions, button(this, play.optBoolean("live") ? "频道 / 线路" : "选集", this::episodes), 8);
     spaced(actions, button(this, "音轨 / 字幕", this::tracks), 8);
     spaced(actions, button(this, "清晰度", this::qualities), 8);
     spaced(actions, button(this, "倍速", this::speed), 8);
@@ -251,8 +257,8 @@ public final class PlayerActivity extends Activity {
         new ExoPlayer.Builder(this)
             .setLoadControl(load)
             .setMediaSourceFactory(new DefaultMediaSourceFactory(cached))
-            .setSeekBackIncrementMs(10000)
-            .setSeekForwardIncrementMs(10000)
+            .setSeekBackIncrementMs(seekMillis())
+            .setSeekForwardIncrementMs(seekMillis())
             .build();
     view.setPlayer(player);
     player.setWakeMode(C.WAKE_MODE_NETWORK);
@@ -268,12 +274,21 @@ public final class PlayerActivity extends Activity {
           @Override
           public void onPlayerError(PlaybackException error) {
             long position = player == null ? resume : Math.max(0, player.getCurrentPosition());
-            scheduleRecovery(error, position);
+            if (!fallbackLive()) scheduleRecovery(error, position);
           }
+
+          @Override public void onTracksChanged(Tracks tracks) { restoreTrackChoices(); }
 
           @Override
           public void onPlaybackStateChanged(int state) {
-            if (state == Player.STATE_ENDED && !seekingNext) next();
+            if (play.optBoolean("live")) {
+              liveBufferingSince = state == Player.STATE_BUFFERING ? SystemClock.elapsedRealtime() : 0;
+            }
+            if (state == Player.STATE_ENDED && !seekingNext) {
+              if (play.optBoolean("live")) {
+                if (!fallbackLive()) scheduleRecovery(new IOException("直播流已中断"), 0);
+              } else next();
+            }
           }
         });
   }
@@ -308,6 +323,10 @@ public final class PlayerActivity extends Activity {
               play.optBoolean("live") || play.optBoolean("music")
                   ? java.util.Collections.emptyList()
                   : EpisodeSkip.parse(play.opt("skips")));
+      player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
+          .clearOverridesOfType(C.TRACK_TYPE_AUDIO).clearOverridesOfType(C.TRACK_TYPE_TEXT)
+          .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, app().repository.settings.getBoolean("player.subtitleOff", false)).build());
+      audioChoiceApplied = subtitleChoiceApplied = false;
       player.setMediaItem(item.build());
       long intro =
           play.optBoolean("live") || play.optBoolean("music")
@@ -315,7 +334,7 @@ public final class PlayerActivity extends Activity {
               : app().repository.settings.getInt("intro", 0) * 1000L;
       player.seekTo(Math.max(resume, intro));
       player.prepare();
-      player.play();
+      player.setPlayWhenReady(foreground);
       handler.removeCallbacks(progress);
       handler.removeCallbacks(sourceSkip);
       handler.postDelayed(progress, 5000);
@@ -335,7 +354,7 @@ public final class PlayerActivity extends Activity {
 
   /** Every automatic attempt refreshes the catalog address through SpiderEngine.resume first. */
   private void scheduleRecovery(Exception failure, long position) {
-    if (released || recoveryScheduled || seekingNext || isFinishing()) return;
+    if (!foreground || released || recoveryScheduled || seekingNext || isFinishing()) return;
     boolean canRetry = !(failure instanceof PlaybackException) || retryable((PlaybackException) failure);
     PlaybackRecovery.Decision decision = recovery.afterFailure(canRetry, position / 1000.0);
     if (decision == null) {
@@ -357,6 +376,7 @@ public final class PlayerActivity extends Activity {
 
   private void refreshAddress(long position) {
     final int generation = operationGeneration;
+    nextAhead.clear();
     app()
         .io
         .execute(
@@ -420,6 +440,7 @@ public final class PlayerActivity extends Activity {
         public void run() {
           if (released || player == null) return;
           save();
+          prefetchNext();
           long duration = player.getDuration(),
               outro = app().repository.settings.getInt("outro", 0) * 1000L;
           if (!play.optBoolean("live")
@@ -438,6 +459,12 @@ public final class PlayerActivity extends Activity {
         public void run() {
           if (released || player == null) return;
           long duration = player.getDuration();
+          if (play.optBoolean("live") && liveBufferingSince > 0
+              && SystemClock.elapsedRealtime() - liveBufferingSince >= 20_000
+              && !recoveryScheduled && !seekingNext) {
+            liveBufferingSince = SystemClock.elapsedRealtime();
+            if (!fallbackLive()) scheduleRecovery(new IOException("直播缓冲超时"), 0);
+          }
           updateLyrics();
           Double target =
               skipPass.target(
@@ -468,6 +495,7 @@ public final class PlayerActivity extends Activity {
   }
 
   private void episodes() {
+    if (play.optBoolean("live")) { liveMenu(); return; }
     List<JSONObject> episodes = Json.objects(Json.array(play.opt("episodes")));
     if (episodes.isEmpty()) {
       Toast.makeText(this, "没有其他集数", android.widget.Toast.LENGTH_SHORT).show();
@@ -484,6 +512,7 @@ public final class PlayerActivity extends Activity {
   }
 
   private boolean next() {
+    if (play.optBoolean("live")) return switchLiveNeighbor(1);
     if (seekingNext) return true;
     JSONObject episode = EpisodePlaylist.next(play);
     if (episode == null) return false;
@@ -497,6 +526,8 @@ public final class PlayerActivity extends Activity {
     cancelRecovery();
     seekingNext = true;
     final int generation = ++operationGeneration;
+    final Future<JSONObject> prepared = nextAhead.take(episodeKey(episode), SystemClock.elapsedRealtime());
+    final int requestedQuality = play.optInt("quality", 0);
     final boolean wasPlaying = player == null || player.getPlayWhenReady();
     if (player != null) player.pause();
     JSONObject site = Json.child(play, "site"), video = Json.child(play, "video");
@@ -505,18 +536,23 @@ public final class PlayerActivity extends Activity {
         .execute(
             () -> {
               try {
-                JSONObject result =
-                    play.optBoolean("live") ? episode : app().engine.playback(site, video, episode);
-                if (play.optBoolean("live")) result.put("episodes", play.opt("episodes"));
+                JSONObject result = null;
+                if (prepared != null) {
+                  try { result = prepared.get(); }
+                  catch (ExecutionException | CancellationException ignored) { /* resolve again below */ }
+                }
+                if (result == null) result = app().engine.playback(site, video, episode, requestedQuality);
+                final JSONObject resolved = result;
                 runOnUiThread(
                     () -> {
                       if (generation != operationGeneration || isFinishing()) return;
-                      play = result;
+                      play = resolved;
                       resume = 0;
                       recovery = new PlaybackRecovery();
                       title.setText(play.optString("name"));
                       subtitle.setText(play.optString("episode"));
                       loadCurrent();
+                      if (!wasPlaying) player.pause();
                       seekingNext = false;
                     });
               } catch (Exception e) {
@@ -530,6 +566,110 @@ public final class PlayerActivity extends Activity {
                     });
               }
             });
+  }
+
+  private long seekMillis() {
+    return Math.max(5, Math.min(60, app().repository.settings.getInt("player.seekSeconds", 10))) * 1000L;
+  }
+
+  private String episodeKey(JSONObject episode) {
+    return Json.child(play, "site").optString("id") + "|" + Json.child(play, "video").optString("vod_id")
+        + "|" + episode.optString("id") + "|" + episode.optString("flag") + "|" + play.optInt("quality", 0);
+  }
+  private void prefetchNext() {
+    if (seekingNext || recoveryScheduled || play.optBoolean("live") || play.optBoolean("music")
+        || play.optBoolean("complete") || !player.isPlaying()
+        || !app().repository.settings.getBoolean("player.prefetchNext", true)) return;
+    long duration = player.getDuration(), position = player.getCurrentPosition();
+    if (duration <= 0 || position < 5000 || (duration > 600_000 && duration - position > 30_000)) return;
+    JSONObject episode = EpisodePlaylist.next(play);
+    if (episode == null) return;
+    JSONObject site = Json.copy(Json.child(play, "site")), video = Json.copy(Json.child(play, "video"));
+    int quality = play.optInt("quality", 0);
+    nextAhead.begin(episodeKey(episode), SystemClock.elapsedRealtime(),
+        () -> app().engine.playback(site, video, episode, quality), nextResolver);
+  }
+
+  private void restoreTrackChoices() {
+    if (player == null) return;
+    for (int type : new int[] {C.TRACK_TYPE_AUDIO, C.TRACK_TYPE_TEXT}) {
+      if (type == C.TRACK_TYPE_AUDIO ? audioChoiceApplied : subtitleChoiceApplied) continue;
+      if (type == C.TRACK_TYPE_TEXT && app().repository.settings.getBoolean("player.subtitleOff", false)) {
+        subtitleChoiceApplied = true;
+        player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
+            .setTrackTypeDisabled(type, true).build());
+        continue;
+      }
+      List<TrackChoice> choices = new ArrayList<>();
+      List<TrackSelectionOverride> overrides = new ArrayList<>();
+      for (Tracks.Group group : player.getCurrentTracks().getGroups()) if (group.getType() == type)
+        for (int i = 0; i < group.length; i++) if (group.isTrackSupported(i)) {
+          Format format = group.getTrackFormat(i);
+          choices.add(new TrackChoice(format.label, format.language));
+          overrides.add(new TrackSelectionOverride(group.getMediaTrackGroup(), i));
+        }
+      String prefix = type == C.TRACK_TYPE_TEXT ? "player.subtitle" : "player.audio";
+      int index = new TrackChoice(app().repository.settings.getString(prefix + ".name", ""),
+          app().repository.settings.getString(prefix + ".language", "")).find(choices);
+      if (index >= 0) {
+        if (type == C.TRACK_TYPE_AUDIO) audioChoiceApplied = true; else subtitleChoiceApplied = true;
+        player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
+            .setTrackTypeDisabled(type, false).setOverrideForType(overrides.get(index)).build());
+      }
+    }
+  }
+
+  private boolean fallbackLive() {
+    if (!foreground || !play.optBoolean("live") || released || seekingNext || recoveryScheduled
+        || !app().repository.settings.getBoolean("player.liveFallback", true)) return false;
+    JSONObject line = LiveChannels.nextLine(play, failedLiveLines);
+    if (line == null) return false;
+    recoveryScheduled = true;
+    final int generation = ++operationGeneration;
+    retry = () -> {
+      if (released || generation != operationGeneration) return;
+      recoveryScheduled = false;
+      play = LiveChannels.withLine(play, line); resume = 0;
+      Toast.makeText(this, "线路不可用，切换到" + line.optString("episode", "备用线路"), Toast.LENGTH_SHORT).show();
+      title.setText(play.optString("name")); subtitle.setText(play.optString("episode"));
+      loadCurrent();
+    };
+    handler.postDelayed(retry, 500);
+    return true;
+  }
+
+  private void liveMenu() {
+    new AlertDialog.Builder(this).setTitle(play.optString("name"))
+        .setItems(new String[] {"频道列表", "切换线路"}, (dialog, which) -> {
+          List<JSONObject> items = Json.objects(Json.array(play.opt(which == 0 ? "liveChannels" : "liveLines")));
+          if (items.isEmpty()) { Toast.makeText(this, "没有其他频道或线路", Toast.LENGTH_SHORT).show(); return; }
+          String[] labels = new String[items.size()];
+          for (int i = 0; i < labels.length; i++) labels[i] = items.get(i).optString(which == 0 ? "name" : "episode");
+          new AlertDialog.Builder(this).setTitle(which == 0 ? "频道" : "线路")
+              .setItems(labels, (d, index) -> selectLive(items.get(index), which == 0)).setNegativeButton("返回", null).show();
+        }).setNegativeButton("返回", null).show();
+  }
+  private void selectLive(JSONObject selected, boolean channel) {
+    cancelRecovery(); nextAhead.clear(); operationGeneration++; failedLiveLines.clear();
+    if (channel) {
+      JSONObject target = Json.copy(selected);
+      try { target.put("liveChannels", play.opt("liveChannels")); }
+      catch (JSONException impossible) { throw new IllegalArgumentException(impossible); }
+      List<JSONObject> lines = Json.objects(Json.array(target.opt("liveLines")));
+      play = lines.isEmpty() ? target : LiveChannels.withLine(target, lines.get(0));
+    } else play = LiveChannels.withLine(play, selected);
+    resume = 0; recovery = new PlaybackRecovery();
+    title.setText(play.optString("name")); subtitle.setText(play.optString("episode"));
+    loadCurrent();
+  }
+  private boolean switchLiveNeighbor(int direction) {
+    List<JSONObject> channels = Json.objects(Json.array(play.opt("liveChannels")));
+    if (channels.size() < 2) return false;
+    String current = play.optString("liveChannelId", play.optString("id"));
+    for (int i = 0; i < channels.size(); i++) if (channels.get(i).optString("id").equals(current)) {
+      selectLive(channels.get((i + channels.size() + direction) % channels.size()), true); return true;
+    }
+    return false;
   }
 
   private void qualities() {
@@ -555,6 +695,7 @@ public final class PlayerActivity extends Activity {
     if (seekingNext || quality == play.optInt("quality", 0) || player == null) return;
     save();
     cancelRecovery();
+    nextAhead.clear();
     seekingNext = true;
     final int generation = ++operationGeneration;
     final long position = player.getCurrentPosition();
@@ -622,14 +763,12 @@ public final class PlayerActivity extends Activity {
     List<String> labels = new ArrayList<>();
     List<Runnable> actions = new ArrayList<>();
     labels.add("关闭字幕");
-    actions.add(
-        () ->
-            player.setTrackSelectionParameters(
-                player
-                    .getTrackSelectionParameters()
-                    .buildUpon()
-                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                    .build()));
+    actions.add(() -> {
+      app().repository.settings.edit().putBoolean("player.subtitleOff", true).apply();
+      subtitleChoiceApplied = true;
+      player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
+          .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build());
+    });
     for (Tracks.Group group : player.getCurrentTracks().getGroups()) {
       int type = group.getType();
       if (type != C.TRACK_TYPE_AUDIO && type != C.TRACK_TYPE_TEXT) continue;
@@ -640,16 +779,17 @@ public final class PlayerActivity extends Activity {
         labels.add(
             (type == C.TRACK_TYPE_TEXT ? "字幕 · " : "音轨 · ")
                 + (f.label != null ? f.label : f.language != null ? f.language : "" + (i + 1)));
-        actions.add(
-            () ->
-                player.setTrackSelectionParameters(
-                    player
-                        .getTrackSelectionParameters()
-                        .buildUpon()
-                        .setTrackTypeDisabled(type, false)
-                        .setOverrideForType(
-                            new TrackSelectionOverride(group.getMediaTrackGroup(), index))
-                        .build()));
+        actions.add(() -> {
+          String prefix = type == C.TRACK_TYPE_TEXT ? "player.subtitle" : "player.audio";
+          app().repository.settings.edit().putString(prefix + ".name", f.label == null ? "" : f.label)
+              .putString(prefix + ".language", f.language == null ? "" : f.language)
+              .putBoolean("player.subtitleOff", type == C.TRACK_TYPE_TEXT ? false
+                  : app().repository.settings.getBoolean("player.subtitleOff", false)).apply();
+          if (type == C.TRACK_TYPE_TEXT) subtitleChoiceApplied = true; else audioChoiceApplied = true;
+          player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
+              .setTrackTypeDisabled(type, false)
+              .setOverrideForType(new TrackSelectionOverride(group.getMediaTrackGroup(), index)).build());
+        });
       }
     }
     new AlertDialog.Builder(this)
@@ -664,17 +804,25 @@ public final class PlayerActivity extends Activity {
       episodes();
       return true;
     }
+    if (play.optBoolean("live") && (code == KeyEvent.KEYCODE_CHANNEL_UP || code == KeyEvent.KEYCODE_CHANNEL_DOWN
+        || code == KeyEvent.KEYCODE_MEDIA_PREVIOUS || ((code == KeyEvent.KEYCODE_DPAD_UP
+        || code == KeyEvent.KEYCODE_DPAD_DOWN) && !view.isControllerFullyVisible()))) {
+      switchLiveNeighbor(code == KeyEvent.KEYCODE_CHANNEL_UP || code == KeyEvent.KEYCODE_DPAD_UP
+          || code == KeyEvent.KEYCODE_MEDIA_PREVIOUS ? -1 : 1);
+      return true;
+    }
     if (code == KeyEvent.KEYCODE_MEDIA_NEXT) {
       next();
       return true;
     }
     if ((code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT)
         && !view.isControllerFullyVisible()) {
+      if (play.optBoolean("live")) { episodes(); return true; }
       player.seekTo(
           Math.max(
               0,
               player.getCurrentPosition()
-                  + (code == KeyEvent.KEYCODE_DPAD_RIGHT ? 10000 : -10000)));
+                  + (code == KeyEvent.KEYCODE_DPAD_RIGHT ? seekMillis() : -seekMillis())));
       view.showController();
       return true;
     }
@@ -690,6 +838,10 @@ public final class PlayerActivity extends Activity {
   @Override
   protected void onStart() {
     super.onStart();
+    foreground = true;
+    if (player != null && player.getPlayerError() != null && !recoveryScheduled) {
+      if (!fallbackLive()) scheduleRecovery(player.getPlayerError(), Math.max(0, player.getCurrentPosition()));
+    }
     if (player != null && resumeWhenForeground) player.play();
     if (player != null) {
       handler.removeCallbacks(progress);
@@ -701,7 +853,10 @@ public final class PlayerActivity extends Activity {
 
   @Override
   protected void onStop() {
+    foreground = false;
     super.onStop();
+    nextAhead.clear();
+    cancelRecovery();
     save();
     handler.removeCallbacks(progress);
     handler.removeCallbacks(sourceSkip);
@@ -713,6 +868,8 @@ public final class PlayerActivity extends Activity {
 
   @Override
   protected void onDestroy() {
+    nextAhead.clear();
+    nextResolver.shutdownNow();
     if (current() == this) active.clear();
     released = true;
     operationGeneration++;

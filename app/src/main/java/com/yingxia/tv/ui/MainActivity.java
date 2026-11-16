@@ -43,7 +43,7 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
   private boolean catalogLoading, restoringSnapshot;
   private TextView catalogFooter;
   private final List<TextView> nav = new ArrayList<>();
-  private boolean expanded = false;
+  private boolean expanded = false, resumedForUpdates;
   private HandoffServer handoff;
   private static final class VoiceVideoSearch {
     int remaining;
@@ -87,12 +87,34 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     if (handoff == null) handoff = new HandoffServer(this);
     handoff.start();
     XiaoaiBridge.attach(this);
+    resumedForUpdates = true;
+    checkAppUpdates();
   }
 
   @Override
   protected void onPause() {
+    resumedForUpdates = false;
     super.onPause();
     if (handoff != null) handoff.close();
+  }
+
+  private void checkAppUpdates() {
+    if (!app.updates.shouldAutoCheck()) return;
+    app.updates.worker.execute(() -> {
+      try {
+        AppUpdate update = app.updates.check();
+        if (update == null || !update.newerThan(BuildConfig.VERSION_CODE) || app.updates.deferred(update)) return;
+        runOnUiThread(() -> {
+          if (!resumedForUpdates || isFinishing()) return;
+          new AlertDialog.Builder(this).setTitle("发现新版本 " + update.versionName)
+              .setMessage("可在应用内下载并更新，保留订阅、收藏和历史。安装时仍需系统确认。")
+              .setPositiveButton("查看更新", (dialog, which) -> startActivity(new Intent(this, UpdateActivity.class)))
+              .setNegativeButton("稍后", (dialog, which) -> app.updates.defer(update)).show();
+        });
+      } catch (Exception error) {
+        android.util.Log.d("Yingxia.Update", "Automatic update check failed", error);
+      }
+    });
   }
 
   @Override
@@ -1373,7 +1395,7 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
   }
 
   private void renderChannels(JSONObject source, String selected, ChannelLoad load) {
-    List<JSONObject> items = load.items;
+    List<JSONObject> items = LiveChannels.groupLines(load.items);
     LinearLayout filters = actions();
     LinkedHashSet<String> groups = new LinkedHashSet<>();
     groups.add("");
@@ -1402,8 +1424,9 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
         channel -> {
           JSONObject play = Json.copy(channel);
           try {
-            Object lines = channel.has("episodes") ? channel.opt("episodes") : new JSONArray(items);
-            play.put("episodes", lines).put("poster", channel.optString("logo"));
+            play.put("liveChannels", new JSONArray(shown)).put("poster", channel.optString("logo"));
+            List<JSONObject> lines = Json.objects(Json.array(channel.opt("liveLines")));
+            if (!lines.isEmpty()) play = LiveChannels.withLine(play, lines.get(0));
           } catch (JSONException broken) {
             android.util.Log.e("Yingxia.Main", "Cannot prepare live channels", broken);
             toast("无法准备频道线路");
@@ -2067,6 +2090,20 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
                       }
                     })),
         10);
+    spaced(playback, button(this, "快进 / 后退：" + repo.settings.getInt("player.seekSeconds", 10) + " 秒", () ->
+        new AlertDialog.Builder(this).setTitle("快进 / 后退步长")
+            .setItems(new String[] {"5 秒", "10 秒", "15 秒", "30 秒", "60 秒"}, (dialog, index) -> {
+              repo.settings.edit().putInt("player.seekSeconds", new int[] {5, 10, 15, 30, 60}[index]).apply();
+              settings();
+            }).setNegativeButton("取消", null).show()), 10);
+    spaced(playback, button(this, "直播自动切线：" + (repo.settings.getBoolean("player.liveFallback", true) ? "开" : "关"), () -> {
+      repo.settings.edit().putBoolean("player.liveFallback", !repo.settings.getBoolean("player.liveFallback", true)).apply();
+      settings();
+    }), 10);
+    spaced(playback, button(this, "提前解析下一集：" + (repo.settings.getBoolean("player.prefetchNext", true) ? "开" : "关"), () -> {
+      repo.settings.edit().putBoolean("player.prefetchNext", !repo.settings.getBoolean("player.prefetchNext", true)).apply();
+      settings();
+    }), 10);
     sectionTitle("发现");
     LinearLayout discovery = actions();
     String language = discoverLanguage();
@@ -2090,6 +2127,14 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
                       settings();
                     })),
         10);
+    sectionTitle("应用更新");
+    LinearLayout updateActions = actions();
+    spaced(updateActions, button(this, "检查更新 · " + BuildConfig.VERSION_NAME,
+        () -> startActivity(new Intent(this, UpdateActivity.class))), 10);
+    spaced(updateActions, button(this, "自动检查：" + (app.updates.autoCheckEnabled() ? "开" : "关"), () -> {
+      app.updates.setAutoCheck(!app.updates.autoCheckEnabled());
+      settings();
+    }), 10);
     sectionTitle("资料与存储");
     LinearLayout storage = actions();
     spaced(

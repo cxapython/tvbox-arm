@@ -78,12 +78,12 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
 
   public void testUnsupportedSourcesAreHiddenWithoutDeletingUserData() throws Exception {
     JSONArray sites = new JSONArray()
-        .put(Json.obj("key", "visible-guazi", "type", 3, "api", "csp_AppgzGuard"))
-        .put(Json.obj("key", "deferred-cz", "type", 3, "api", "csp_NewCzGuard"))
-        .put(Json.obj("key", "deferred-hm", "type", 3, "api", "csp_HmysGuard"))
-        .put(Json.obj("key", "deferred-libvio", "type", 3, "api", "csp_LibvioGuard"))
-        .put(Json.obj("key", "deferred-python", "type", 3, "api", "./source.py"))
-        .put(Json.obj("key", "visible-api", "type", 1, "api", server.base() + "/api"));
+        .put(Json.obj("key", "visible-guazi", "name", "瓜子不卡", "type", 3, "api", "csp_AppgzGuard"))
+        .put(Json.obj("key", "deferred-cz", "name", "厂长不卡", "type", 3, "api", "csp_NewCzGuard"))
+        .put(Json.obj("key", "deferred-hm", "name", "海绵不卡", "type", 3, "api", "csp_HmysGuard"))
+        .put(Json.obj("key", "deferred-libvio", "name", "立播不卡", "type", 3, "api", "csp_LibvioGuard"))
+        .put(Json.obj("key", "deferred-python", "name", "Python不卡", "type", 3, "api", "./source.py"))
+        .put(Json.obj("key", "visible-api", "name", "API不卡", "type", 1, "api", server.base() + "/api"));
     String origin = server.base() + "/visibility.json";
     app.repository.importConfig(Json.obj("sites", sites).toString().getBytes(StandardCharsets.UTF_8), origin, "visibility");
     Set<String> shown = new HashSet<>();
@@ -403,6 +403,138 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
     media.delete();
   }
 
+  public void testLiveFallbackKeepsChannelIdentityAndPlaysAlternate() throws Exception {
+    JSONObject bad = Json.obj("id", "fixture-channel", "name", "测试直播", "group", "测试", "live", true,
+        "url", server.base() + "/not-video");
+    JSONObject good = Json.obj("id", "fixture-alternate", "name", "测试直播", "group", "测试", "live", true,
+        "url", server.base() + "/playback.mp4");
+    List<JSONObject> channels = LiveChannels.groupLines(java.util.Arrays.asList(bad, good));
+    JSONObject play = LiveChannels.withLine(channels.get(0),
+        Json.array(channels.get(0).opt("liveLines")).getJSONObject(0));
+    play.put("liveChannels", new JSONArray(channels));
+    boolean old = app.repository.settings.getBoolean("player.liveFallback", true);
+    app.repository.settings.edit().putBoolean("player.liveFallback", true).commit();
+    Instrumentation.ActivityMonitor monitor = getInstrumentation().addMonitor(PlayerActivity.class.getName(), null, false);
+    PlayerActivity activity = null;
+    try {
+      getInstrumentation().runOnMainSync(() -> PlayerActivity.open(getActivity(), play));
+      activity = (PlayerActivity) monitor.waitForActivityWithTimeout(10000);
+      assertNotNull(activity);
+      java.lang.reflect.Field field = PlayerActivity.class.getDeclaredField("player"); field.setAccessible(true);
+      java.lang.reflect.Field data = PlayerActivity.class.getDeclaredField("play"); data.setAccessible(true);
+      final PlayerActivity target = activity;
+      long until = System.currentTimeMillis() + 20000;
+      boolean[] advanced = {false};
+      while (System.currentTimeMillis() < until && !advanced[0]) {
+        getInstrumentation().runOnMainSync(() -> {
+          androidx.media3.exoplayer.ExoPlayer player = (androidx.media3.exoplayer.ExoPlayer) read(field, target);
+          advanced[0] = player != null && player.getCurrentPosition() > 1000 && player.isPlaying();
+        });
+        Thread.sleep(200);
+      }
+      assertTrue("Alternate live line did not play", advanced[0]);
+      JSONObject current = (JSONObject) read(data, activity);
+      assertEquals("测试直播", current.optString("name"));
+      assertEquals("fixture-channel", current.optString("liveChannelId"));
+      assertEquals(server.base() + "/playback.mp4", current.optString("url"));
+    } finally {
+      if (activity != null) { PlayerActivity target = activity; getInstrumentation().runOnMainSync(target::finish); }
+      getInstrumentation().removeMonitor(monitor);
+      app.repository.settings.edit().putBoolean("player.liveFallback", old).commit();
+    }
+  }
+
+  public void testSubtitleChoiceSurvivesItemReorderingAndOffIsRemembered() throws Exception {
+    android.content.SharedPreferences prefs = app.repository.settings;
+    String oldName = prefs.getString("player.subtitle.name", ""), oldLanguage = prefs.getString("player.subtitle.language", "");
+    boolean oldOff = prefs.getBoolean("player.subtitleOff", false);
+    prefs.edit().putString("player.subtitle.name", "中文").putString("player.subtitle.language", "")
+        .putBoolean("player.subtitleOff", false).commit();
+    File media = new File(getActivity().getFilesDir(), "subtitle-choice.mp4");
+    File zh = new File(getActivity().getFilesDir(), "choice-zh.srt"), en = new File(getActivity().getFilesDir(), "choice-en.srt");
+    try (InputStream in = getInstrumentation().getContext().getAssets().open("playback.mp4");
+        OutputStream out = new FileOutputStream(media)) { out.write(readAll(in)); }
+    for (File file : new File[] {zh, en}) try (OutputStream out = new FileOutputStream(file)) {
+      out.write("1\n00:00:00,000 --> 00:01:00,000\nSubtitle fixture\n".getBytes(StandardCharsets.UTF_8));
+    }
+    JSONObject chinese = Json.obj("name", "中文", "url", UriString(zh));
+    JSONObject english = Json.obj("name", "English", "url", UriString(en));
+    JSONObject play = Json.obj("id", "subtitle-choice", "name", "字幕测试", "url", UriString(media),
+        "subtitles", new JSONArray().put(chinese).put(english));
+    Instrumentation.ActivityMonitor monitor = getInstrumentation().addMonitor(PlayerActivity.class.getName(), null, false);
+    PlayerActivity activity = null;
+    try {
+      getInstrumentation().runOnMainSync(() -> PlayerActivity.open(getActivity(), play));
+      activity = (PlayerActivity) monitor.waitForActivityWithTimeout(10000); assertNotNull(activity);
+      java.lang.reflect.Field field = PlayerActivity.class.getDeclaredField("player"); field.setAccessible(true);
+      java.lang.reflect.Field data = PlayerActivity.class.getDeclaredField("play"); data.setAccessible(true);
+      java.lang.reflect.Method load = PlayerActivity.class.getDeclaredMethod("loadCurrent"); load.setAccessible(true);
+      waitForSelectedSubtitle(activity, field, true);
+      final PlayerActivity target = activity;
+      getInstrumentation().runOnMainSync(() -> {
+        try {
+          ((JSONObject) read(data, target)).put("subtitles", new JSONArray().put(english).put(chinese));
+          load.invoke(target);
+        } catch (Exception error) { throw new AssertionError(error); }
+      });
+      waitForSelectedSubtitle(activity, field, true);
+      prefs.edit().putBoolean("player.subtitleOff", true).commit();
+      getInstrumentation().runOnMainSync(() -> {
+        try { load.invoke(target); } catch (Exception error) { throw new AssertionError(error); }
+      });
+      waitForSelectedSubtitle(activity, field, false);
+    } finally {
+      if (activity != null) { PlayerActivity target = activity; getInstrumentation().runOnMainSync(target::finish); }
+      getInstrumentation().removeMonitor(monitor); media.delete(); zh.delete(); en.delete();
+      prefs.edit().putString("player.subtitle.name", oldName).putString("player.subtitle.language", oldLanguage)
+          .putBoolean("player.subtitleOff", oldOff).commit();
+    }
+  }
+
+  private void waitForSelectedSubtitle(PlayerActivity target, java.lang.reflect.Field field, boolean enabled) throws Exception {
+    boolean[] found = {false}; long until = System.currentTimeMillis() + 8000;
+    while (!found[0] && System.currentTimeMillis() < until) {
+      getInstrumentation().runOnMainSync(() -> {
+        androidx.media3.exoplayer.ExoPlayer player = (androidx.media3.exoplayer.ExoPlayer) read(field, target);
+        if (!enabled) {
+          found[0] = player.getTrackSelectionParameters().disabledTrackTypes.contains(androidx.media3.common.C.TRACK_TYPE_TEXT)
+              && !player.getCurrentTracks().isTypeSelected(androidx.media3.common.C.TRACK_TYPE_TEXT);
+        } else for (androidx.media3.common.Tracks.Group group : player.getCurrentTracks().getGroups()) {
+          if (group.getType() != androidx.media3.common.C.TRACK_TYPE_TEXT) continue;
+          for (int i = 0; i < group.length; i++) if (group.isTrackSelected(i) && "中文".equals(group.getTrackFormat(i).label)) found[0] = true;
+        }
+      });
+      if (!found[0]) Thread.sleep(100);
+    }
+    assertTrue("Subtitle selection not restored (enabled=" + enabled + ")", found[0]);
+  }
+
+  public void testSeekStepUsesConfiguredValueForControlsAndRemote() throws Exception {
+    int old = app.repository.settings.getInt("player.seekSeconds", 10);
+    app.repository.settings.edit().putInt("player.seekSeconds", 30).commit();
+    File media = new File(getActivity().getFilesDir(), "configured-seek.mp4");
+    try (InputStream in = getInstrumentation().getContext().getAssets().open("playback.mp4");
+        OutputStream out = new FileOutputStream(media)) { out.write(readAll(in)); }
+    JSONObject play = Json.obj("id", "configured-seek", "name", "步长测试", "url", UriString(media));
+    Instrumentation.ActivityMonitor monitor = getInstrumentation().addMonitor(PlayerActivity.class.getName(), null, false);
+    PlayerActivity activity = null;
+    try {
+      getInstrumentation().runOnMainSync(() -> PlayerActivity.open(getActivity(), play));
+      activity = (PlayerActivity) monitor.waitForActivityWithTimeout(10000); assertNotNull(activity);
+      java.lang.reflect.Field field = PlayerActivity.class.getDeclaredField("player"); field.setAccessible(true);
+      final PlayerActivity target = activity;
+      getInstrumentation().runOnMainSync(() -> {
+        androidx.media3.exoplayer.ExoPlayer player = (androidx.media3.exoplayer.ExoPlayer) read(field, target);
+        assertEquals(30000L, player.getSeekBackIncrement());
+        assertEquals(30000L, player.getSeekForwardIncrement());
+      });
+    } finally {
+      if (activity != null) { PlayerActivity target = activity; getInstrumentation().runOnMainSync(target::finish); }
+      getInstrumentation().removeMonitor(monitor); media.delete();
+      app.repository.settings.edit().putInt("player.seekSeconds", old).commit();
+    }
+  }
+
   public void testSeekControlsUseVectorButtons() throws Exception {
     File media = new File(getActivity().getFilesDir(), "seek-controls-video.mp4");
     try (InputStream in = getInstrumentation().getContext().getAssets().open("playback.mp4");
@@ -427,8 +559,13 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
       assertNotNull(forward);
       assertTrue(rewind.getDrawable() instanceof android.graphics.drawable.VectorDrawable);
       assertTrue(forward.getDrawable() instanceof android.graphics.drawable.VectorDrawable);
-      assertTrue(rewind.getContentDescription().toString().contains("快退"));
-      assertTrue(forward.getContentDescription().toString().contains("快进"));
+      int step = Math.max(5, Math.min(60, app.repository.settings.getInt("player.seekSeconds", 10)));
+      assertEquals(player.getResources().getQuantityString(
+          androidx.media3.ui.R.plurals.exo_controls_rewind_by_amount_description, step, step),
+          rewind.getContentDescription().toString());
+      assertEquals(player.getResources().getQuantityString(
+          androidx.media3.ui.R.plurals.exo_controls_fastforward_by_amount_description, step, step),
+          forward.getContentDescription().toString());
       assertEquals(
           android.view.View.GONE,
           player.getWindow().getDecorView().findViewById(androidx.media3.ui.R.id.exo_basic_controls)
@@ -520,13 +657,13 @@ public final class RuntimeIntegrationTest extends ActivityInstrumentationTestCas
       return Json.obj(
               "sites",
               new JSONArray()
-                  .put(Json.obj("key", "api", "name", "示例影视", "api", base() + "/api", "type", 1))
+                  .put(Json.obj("key", "api", "name", "示例影视不卡", "api", base() + "/api", "type", 1))
                   .put(
                       Json.obj(
                           "key",
                           "script",
                           "name",
-                          "脚本影视",
+                          "脚本影视不卡",
                           "api",
                           base() + "/spider.js",
                           "type",

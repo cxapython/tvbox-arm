@@ -9,6 +9,7 @@ public final class YingxiaApp extends Application {
   public Http http;
   public Repository repository;
   public SpiderEngine engine;
+  public AppUpdates updates;
   public final ExecutorService io =
       Executors.newFixedThreadPool(4, r -> new Thread(r, "yingxia-io"));
 
@@ -23,5 +24,6 @@ public final class YingxiaApp extends Application {
     http = new Http(this);
     repository = new Repository(this);
     engine = new SpiderEngine(this);
+    updates = new AppUpdates(this);
   }
 }

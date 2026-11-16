@@ -63,4 +63,21 @@ public class LiveChannelsTest {
         .put(Json.obj("name", "没有地址")));
     assertTrue(LiveChannels.fromInline(source).isEmpty());
   }
+  @Test public void groupsSameChannelLinesButNeverDifferentGroupsAndStopsAfterEachFails() throws Exception {
+    JSONObject one = Json.obj("id", "1", "name", "CCTV1", "group", "央视", "url", "https://one/live");
+    JSONObject two = Json.obj("id", "2", "name", "CCTV1", "group", "央视", "url", "https://two/live");
+    JSONObject otherGroup = Json.obj("id", "3", "name", "CCTV1", "group", "其他", "url", "https://three/live");
+    java.util.List<JSONObject> channels = LiveChannels.groupLines(java.util.List.of(one, two, otherGroup));
+    assertEquals(2, channels.size());
+    assertEquals(2, Json.array(channels.get(0).opt("liveLines")).length());
+    JSONObject play = LiveChannels.withLine(channels.get(0), Json.array(channels.get(0).opt("liveLines")).getJSONObject(0));
+    java.util.Set<String> failed = new java.util.HashSet<>();
+    JSONObject alternate = LiveChannels.nextLine(play, failed);
+    assertEquals("https://two/live", alternate.optString("url"));
+    play = LiveChannels.withLine(play, alternate);
+    assertEquals("CCTV1", play.optString("name"));
+    assertEquals("1", play.optString("liveChannelId"));
+    assertNull(LiveChannels.nextLine(play, failed));
+  }
+
 }
