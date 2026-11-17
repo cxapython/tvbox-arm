@@ -7,7 +7,7 @@ import org.json.JSONObject;
 /** Strict, numeric update contract for this Android port, never for the Apple upstream. */
 public final class AppUpdate {
   public static final String REPOSITORY = "cxapython/tvbox-arm";
-  public static final String API = "https://api.github.com/repos/" + REPOSITORY + "/releases/latest";
+  public static final String MANIFEST_URL = "https://github.com/" + REPOSITORY + "/releases/latest/download/update.json";
   public static final String APK_NAME = "yingxia-tv-arm32.apk";
   public static final long MAX_APK_BYTES = 100L * 1024 * 1024;
   public final int versionCode, minSdk;

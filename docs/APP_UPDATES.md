@@ -97,3 +97,11 @@ Android 12 / API 31 TV 模拟器进行了实际 PackageManager 归档、证书�
 未连接 ARM32 小米电视；未验证该电视系统的安装确认界面、GitHub 网络可达性和真实升级。本地验证不包含新版 GitHub Actions 的线上结果；固定签名配置和首次签名衔接仍需部署时确认。
 
 完整检查数量与产物见 [UPDATE_BUILD_REPORT.md](UPDATE_BUILD_REPORT.md)。
+
+## android.6：更新检查限流修正（2026-11-17）
+
+- 检查入口改为固定的本仓库 `/releases/latest/download/update.json`，经 GitHub 官方 HTTPS 跳转读取附件，不再调用匿名 REST API；没有增加镜像、Token 或自定义更新地址。
+- 404 表示当前正式 Release 尚无更新描述，显示“线上暂未提供新的应用内更新包”，不会误报为已经是最新版本。
+- 429，或带有耗尽配额/Retry-After 证据的 403，才提示限流；普通 403 显示拒绝访问及网络/代理排查建议。
+- 保留 32 KiB 元数据上限、APK 官方地址限制和安装前的真实签名/包名/版本/哈希/ARM32 检查；若跳转链包含带标签附件地址，也核对清单标签。
+- 此修改不等于正式更新渠道已上线。固定签名和包含 update.json 的 Release 仍需配置、发布。

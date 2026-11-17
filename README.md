@@ -2,7 +2,7 @@
 
 **为小米电视、Android TV 和 ARM32 电视盒子打造的原生影音应用。** 横屏大屏布局、方向键焦点导航和遥控器播放操作，基于 [tvbox-silicon / 映匣](https://github.com/jo32/tvbox-silicon) 移植，使用 Java、QuickJS 与 AndroidX Media3。
 
-当前版本：`1.8.15-android.5-tv`。最低 Android 5.0 / API 21。电视安装包仅包含 `armeabi-v7a` 原生库。
+当前版本：`1.8.15-android.6-tv`。最低 Android 5.0 / API 21。电视安装包仅包含 `armeabi-v7a` 原生库。
 
 ## 电视上能做什么
 

@@ -71,52 +71,14 @@ public final class AppUpdates {
   public File readyFile() { return new File(context.getCacheDir(), "updates/app-update.apk"); }
   public long downloadId() { return prefs.getLong("downloadId", -1); }
 
-  /** Called on worker only. Official release and manifest are bounded and fetched over real TLS. */
+  /** Called on worker only. Fetch the official release asset, not the rate-limited REST API. */
   public AppUpdate check() throws Exception {
     prefs.edit().putLong("lastCheck", System.currentTimeMillis()).apply();
-    JSONObject release = json(AppUpdate.API, 256 * 1024, true);
-    if (release == null) { prefs.edit().remove("latest").apply(); return null; }
-    if (release.optBoolean("draft") || release.optBoolean("prerelease"))
-      throw new IOException("没有可用的正式发布版本");
-    String tag = release.optString("tag_name"), manifestUrl = "";
-    for (JSONObject asset : Json.objects(release.optJSONArray("assets") == null
-        ? new org.json.JSONArray() : release.optJSONArray("assets"))) {
-      if ("update.json".equals(asset.optString("name"))) manifestUrl = asset.optString("browser_download_url");
-    }
-    if (manifestUrl.isEmpty()) { prefs.edit().remove("latest").apply(); return null; }
-    AppUpdate.requireAssetUrl(manifestUrl, tag, "update.json");
-    AppUpdate update = new AppUpdate(json(manifestUrl, 32 * 1024, false));
-    if (!tag.equals(update.tag)) throw new IOException("更新描述与发布标签不一致");
-    boolean found = false;
-    for (JSONObject asset : Json.objects(release.optJSONArray("assets")))
-      if (AppUpdate.APK_NAME.equals(asset.optString("name"))
-          && update.apkUrl.equals(asset.optString("browser_download_url"))
-          && update.size == asset.optLong("size")) found = true;
-    if (!found) throw new IOException("发布中缺少与描述匹配的电视安装包");
+    AppUpdate update = UpdateFeed.fetch(http, BuildConfig.VERSION_NAME);
+    if (update == null) { prefs.edit().remove("latest").apply(); return null; }
     if (update.newerThan(BuildConfig.VERSION_CODE)) compatible(update);
     prefs.edit().putString("latest", update.json().toString()).apply();
     return update;
-  }
-
-  private JSONObject json(String url, int limit, boolean missingAllowed) throws Exception {
-    Request request = new Request.Builder().url(url).header("Accept", "application/json")
-        .header("User-Agent", "Yingxia-TV/" + BuildConfig.VERSION_NAME)
-        .cacheControl(new CacheControl.Builder().noCache().build()).build();
-    try (Response response = http.newCall(request).execute()) {
-      if (missingAllowed && response.code() == 404) return null;
-      if (!response.isSuccessful()) throw new IOException(response.code() == 403 || response.code() == 429
-          ? "更新服务暂时限流，请稍后重试" : "更新服务返回 HTTP " + response.code());
-      if (!response.request().url().isHttps() || response.body() == null)
-        throw new IOException("更新连接不安全或内容为空");
-      try (InputStream in = response.body().byteStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-        byte[] buffer = new byte[8192]; int count;
-        while ((count = in.read(buffer)) != -1) {
-          if (out.size() + count > limit) throw new IOException("更新描述超过大小限制");
-          out.write(buffer, 0, count);
-        }
-        return new JSONObject(out.toString("UTF-8"));
-      }
-    }
   }
 
   private void compatibleIdentity(AppUpdate update) throws Exception {
