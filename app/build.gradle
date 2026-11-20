@@ -11,8 +11,12 @@ android {
         applicationId 'com.yingxia.tv'
         minSdk 21
         targetSdk 34 // minSdk stays 21 for older Xiaomi TVs.
-        versionCode 6
-        versionName '1.8.15-android.6-tv'
+        versionCode 7
+        versionName '1.8.15-android.7-tv'
+        if (project.hasProperty('releaseVersionCode') || project.hasProperty('releaseVersionName')) {
+            versionCode Integer.parseInt(project.property('releaseVersionCode').toString())
+            versionName project.property('releaseVersionName').toString()
+        }
         ndk { abiFilters 'armeabi-v7a' }
         externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_static'; cFlags '-O2' } }
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'

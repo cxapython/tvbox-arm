@@ -23,6 +23,9 @@ import org.json.JSONObject;
 /** System-owned background downloads; every APK is copied privately and verified before sharing. */
 public final class AppUpdates {
   public static final String AUTO_CHECK = "updates.autoCheck";
+  private static final String INSTALL_VERSION = "installVersion";
+  private static final String INSTALL_STARTED = "installStarted";
+  private static final long INSTALL_WINDOW = 30L * 60 * 1000;
   private static final long CHECK_INTERVAL = 24L * 60 * 60 * 1000;
   private final Context context;
   private final SharedPreferences prefs;
@@ -71,12 +74,42 @@ public final class AppUpdates {
   public File readyFile() { return new File(context.getCacheDir(), "updates/app-update.apk"); }
   public long downloadId() { return prefs.getLong("downloadId", -1); }
 
+  /** Persist before handing the update to Android, since the installer kills this process on success. */
+  public void markInstallerOpened(AppUpdate update) {
+    if (!prefs.edit().putInt(INSTALL_VERSION, update.versionCode)
+        .putLong(INSTALL_STARTED, System.currentTimeMillis()).commit())
+      android.util.Log.w("Yingxia.Update", "Unable to persist install handoff");
+  }
+
+  public boolean completedInstall() {
+    long elapsed = System.currentTimeMillis() - prefs.getLong(INSTALL_STARTED, 0);
+    return prefs.getInt(INSTALL_VERSION, 0) == BuildConfig.VERSION_CODE && elapsed >= 0 && elapsed < INSTALL_WINDOW;
+  }
+
+  public void clearInstallHandoff() {
+    prefs.edit().remove(INSTALL_VERSION).remove(INSTALL_STARTED).apply();
+  }
+
+  public synchronized void clearInstalledApk() {
+    AppUpdate update = saved("ready");
+    if (update != null && !update.newerThan(BuildConfig.VERSION_CODE)) discardReady();
+  }
+
+  public synchronized void discardReady() {
+    prefs.edit().remove("ready").apply();
+    File file = readyFile();
+    if (file.exists() && !file.delete()) android.util.Log.w("Yingxia.Update", "Cannot delete cached update APK");
+  }
+
   /** Called on worker only. Fetch the official release asset, not the rate-limited REST API. */
   public AppUpdate check() throws Exception {
     prefs.edit().putLong("lastCheck", System.currentTimeMillis()).apply();
     AppUpdate update = UpdateFeed.fetch(http, BuildConfig.VERSION_NAME);
     if (update == null) { prefs.edit().remove("latest").apply(); return null; }
-    if (update.newerThan(BuildConfig.VERSION_CODE)) compatible(update);
+    if (update.newerThan(BuildConfig.VERSION_CODE)) {
+      try { compatible(update); }
+      catch (Exception error) { prefs.edit().remove("latest").apply(); throw error; }
+    }
     prefs.edit().putString("latest", update.json().toString()).apply();
     return update;
   }

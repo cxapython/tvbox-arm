@@ -88,6 +88,12 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
     handoff.start();
     XiaoaiBridge.attach(this);
     resumedForUpdates = true;
+    if (app.updates.completedInstall()) {
+      app.updates.clearInstallHandoff();
+      app.updates.worker.execute(app.updates::clearInstalledApk);
+      UpdateRelaunch.clearNotice(this);
+      Toast.makeText(this, "已更新至 " + BuildConfig.VERSION_NAME, Toast.LENGTH_SHORT).show();
+    }
     checkAppUpdates();
   }
 
@@ -107,7 +113,7 @@ public final class MainActivity extends Activity implements XiaoaiBridge.Target 
         runOnUiThread(() -> {
           if (!resumedForUpdates || isFinishing()) return;
           new AlertDialog.Builder(this).setTitle("发现新版本 " + update.versionName)
-              .setMessage("可在应用内下载并更新，保留订阅、收藏和历史。安装时仍需系统确认。")
+              .setMessage("可直接在应用内下载。确认系统安装后，打开新版即可继续使用；订阅、收藏和历史会保留。")
               .setPositiveButton("查看更新", (dialog, which) -> startActivity(new Intent(this, UpdateActivity.class)))
               .setNegativeButton("稍后", (dialog, which) -> app.updates.defer(update)).show();
         });

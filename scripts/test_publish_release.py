@@ -24,14 +24,7 @@ class PublishReleaseTest(unittest.TestCase):
         self.assets.mkdir()
         apk = self.assets / 'yingxia-tv-arm32.apk'
         apk.write_bytes(b'verified artifact fixture')
-        metadata = dict(schema=1, applicationId='com.yingxia.tv', abi='armeabi-v7a', versionCode=5,
-                        versionName='1.8.15-android.5-tv', tag='v1.8.15-android.5-tv',
-                        apkUrl='https://github.com/cxapython/tvbox-arm/releases/download/v1.8.15-android.5-tv/yingxia-tv-arm32.apk',
-                        size=apk.stat().st_size, sha256=hashlib.sha256(apk.read_bytes()).hexdigest())
-        (self.assets / 'update.json').write_text(json.dumps(metadata))
-        (self.assets / 'SHA256SUMS').write_text(''.join(
-            hashlib.sha256((self.assets / name).read_bytes()).hexdigest() + '  ' + name + '\n'
-            for name in ['yingxia-tv-arm32.apk', 'update.json']))
+        self.write_manifest(5, '1.8.15-android.5-tv')
         self.git = shutil.which('git')
         for command in [('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@invalid'),
                         ('add', '.'), ('commit', '-qm', 'fixture')]:
@@ -41,6 +34,7 @@ class PublishReleaseTest(unittest.TestCase):
         (self.bin / 'gh').write_text('''#!/usr/bin/env bash
 if [[ "$1 $2" == 'release view' ]]; then
   if [[ "$3" == --json ]]; then
+    [[ -n "$PREVIOUS_TAG" ]] && { echo "$PREVIOUS_TAG"; exit 0; }
     [[ "$MODE" == oldcode ]] && { echo vprevious; exit 0; }
     exit 1
   fi
@@ -51,6 +45,14 @@ fi
 echo "gh $*" >> "$TRACE"
 ''')
         (self.bin / 'git').write_text(f'''#!/usr/bin/env bash
+if [[ "$1" == ls-remote ]]; then
+  if [[ "$MODE" == stale_at_publish && -f "$TRACE" ]]; then
+    printf '%s\\trefs/heads/main\\n' outdated
+  else
+    printf '%s\\trefs/heads/main\\n' "$REMOTE_MAIN"
+  fi
+  exit 0
+fi
 if [[ "$1" == push ]]; then echo "git $*" >> "$TRACE"; exit 0; fi
 exec '{self.git}' "$@"
 ''')
@@ -59,7 +61,24 @@ exec '{self.git}' "$@"
         self.trace = self.root / 'trace'
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
                         TRACE=str(self.trace), GITHUB_REF='refs/heads/main')
-        self.env.pop('GITHUB_SHA', None)
+        for key in ('GITHUB_SHA', 'TVBOX_RELEASE_RUN', 'PREVIOUS_TAG'):
+            self.env.pop(key, None)
+
+    def write_manifest(self, code, name):
+        apk = self.assets / 'yingxia-tv-arm32.apk'
+        metadata = dict(schema=1, applicationId='com.yingxia.tv', abi='armeabi-v7a', versionCode=code,
+                        versionName=name, tag='v' + name,
+                        apkUrl=f'https://github.com/cxapython/tvbox-arm/releases/download/v{name}/yingxia-tv-arm32.apk',
+                        size=apk.stat().st_size, sha256=hashlib.sha256(apk.read_bytes()).hexdigest())
+        (self.assets / 'update.json').write_text(json.dumps(metadata))
+        (self.assets / 'SHA256SUMS').write_text(''.join(
+            hashlib.sha256((self.assets / asset).read_bytes()).hexdigest() + '  ' + asset + '\n'
+            for asset in ['yingxia-tv-arm32.apk', 'update.json']))
+
+    def enable_auto_release(self, run=42):
+        commit = subprocess.check_output([self.git, 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
+        self.env.update(GITHUB_SHA=commit, REMOTE_MAIN=commit, TVBOX_RELEASE_RUN=str(run))
+        self.write_manifest(10000 + run, f'1.8.15-android.5-tv-r{10000 + run}')
 
     def run_release(self, mode):
         return subprocess.run(['bash', str(SCRIPT), str(self.assets)], cwd=self.root,
@@ -106,6 +125,58 @@ exec '{self.git}' "$@"
         result = self.run_release('oldcode')
         self.assertNotEqual(0, result.returncode)
         self.assertIn('must be greater', result.stderr)
+        self.assertFalse(self.trace.exists())
+
+    def test_automatic_release_uses_unique_numeric_version_for_same_base(self):
+        self.enable_auto_release()
+        self.env['PREVIOUS_TAG'] = 'v1.8.15-android.5-tv-r10041'
+        result = self.run_release('fresh')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('Published v1.8.15-android.5-tv-r10042', result.stdout)
+        self.assertIn('git push origin v1.8.15-android.5-tv-r10042', self.trace.read_text())
+        # A retry of the same workflow run resolves to the same published tag.
+        self.trace.unlink()
+        result = self.run_release('published')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('v1.8.15-android.5-tv-r10042 is already published', result.stdout)
+        self.assertFalse(self.trace.exists())
+
+    def test_automatic_run_cannot_downgrade_latest(self):
+        self.enable_auto_release()
+        self.env['PREVIOUS_TAG'] = 'v1.8.15-android.5-tv-r10043'
+        result = self.run_release('fresh')
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('must be greater', result.stderr)
+        self.assertFalse(self.trace.exists())
+
+    def test_stale_main_commit_is_not_published(self):
+        self.enable_auto_release()
+        self.env['REMOTE_MAIN'] = 'different commit'
+        result = self.run_release('fresh')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('main has advanced', result.stdout)
+        self.assertFalse(self.trace.exists())
+
+    def test_main_advance_during_upload_keeps_draft(self):
+        self.enable_auto_release()
+        result = self.run_release('stale_at_publish')
+        self.assertEqual(0, result.returncode, result.stderr)
+        trace = self.trace.read_text()
+        self.assertIn('release upload', trace)
+        self.assertNotIn('--draft=false', trace)
+
+    def test_invalid_automatic_run_is_rejected(self):
+        self.enable_auto_release()
+        self.env['TVBOX_RELEASE_RUN'] = '042'
+        result = self.run_release('fresh')
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('valid workflow run number', result.stderr)
+        self.assertFalse(self.trace.exists())
+
+    def test_missing_checksum_entry_is_rejected(self):
+        checksums = self.assets / 'SHA256SUMS'
+        checksums.write_text(checksums.read_text().splitlines()[0] + '\n')
+        self.assertNotEqual(0, self.run_release('fresh').returncode)
         self.assertFalse(self.trace.exists())
 
 if __name__ == '__main__':

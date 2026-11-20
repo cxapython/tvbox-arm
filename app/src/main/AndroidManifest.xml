@@ -36,6 +36,9 @@
             android:exported="false" android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/update_paths" />
         </provider>
+        <receiver android:name=".data.UpdateRelaunch" android:exported="false">
+            <intent-filter><action android:name="android.intent.action.MY_PACKAGE_REPLACED" /></intent-filter>
+        </receiver>
         <activity android:name=".ui.UpdateActivity" android:screenOrientation="landscape" android:exported="false" />
         <activity android:name=".ui.PlayerActivity" android:screenOrientation="landscape" android:exported="false" android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
         <activity android:name=".ui.MusicPlayerActivity" android:screenOrientation="landscape" android:exported="false" />

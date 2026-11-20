@@ -7,7 +7,14 @@ cd "$project_dir"
 sdk_dir=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-"$HOME/Library/Android/sdk"}}
 build_tools="$sdk_dir/build-tools/34.0.0"
 python3 -m unittest discover -s scripts -p 'test_*.py'
-./gradlew testDebugUnitTest lintDebug assembleRelease
+if [ -n "${TVBOX_RELEASE_RUN:-}" ]; then
+    version=$(bash scripts/release-version.sh)
+    set -- "-PreleaseVersionCode=$(printf '%s\n' "$version" | sed -n '1p')" \
+        "-PreleaseVersionName=$(printf '%s\n' "$version" | sed -n '2p')"
+else
+    set --
+fi
+./gradlew "$@" testDebugUnitTest lintDebug assembleRelease
 mkdir -p artifacts
 signing_key=${YINGXIA_SIGNING_KEY:-"$HOME/.android/debug.keystore"}
 if [ ! -f "$signing_key" ]; then

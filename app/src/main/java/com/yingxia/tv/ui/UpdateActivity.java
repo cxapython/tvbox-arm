@@ -16,6 +16,7 @@ import com.yingxia.tv.YingxiaApp;
 import com.yingxia.tv.core.AppUpdate;
 import com.yingxia.tv.core.Json;
 import com.yingxia.tv.data.AppUpdates;
+import com.yingxia.tv.data.UpdateRelaunch;
 
 /** Remote-friendly updater. Installation is always delegated to Android's confirmation UI. */
 public final class UpdateActivity extends Activity {
@@ -24,13 +25,19 @@ public final class UpdateActivity extends Activity {
   private TextView status, version, action, cancel, notes;
   private ProgressBar progress;
   private final Handler handler = new Handler(Looper.getMainLooper());
-  private boolean resumed, busy, waitingPermission, installWhenReady;
+  private boolean resumed, busy, waitingPermission, installWhenReady, installerOpened;
 
   @Override public void onCreate(Bundle saved) {
     super.onCreate(saved);
     updates = YingxiaApp.get().updates;
     waitingPermission = saved != null && saved.getBoolean("waitingPermission");
-    installWhenReady = saved != null && saved.getBoolean("installWhenReady");
+    if (updates.completedInstall()) {
+      startActivity(UpdateRelaunch.openApp(this));
+      finish();
+      return;
+    }
+    installerOpened = saved != null && saved.getBoolean("installerOpened");
+    installWhenReady = updates.downloadId() >= 0 || (saved != null && saved.getBoolean("installWhenReady"));
     LinearLayout page = vertical(this); pad(page, 40, 32); page.setBackgroundColor(BACKGROUND);
     ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.addView(page); setContentView(scroll);
     page.addView(text(this, "应用更新", 30, TEXT)); gap(page, 16);
@@ -43,20 +50,29 @@ public final class UpdateActivity extends Activity {
     page.addView(progress, new LinearLayout.LayoutParams(-1, dp(this, 12))); gap(page, 20);
     LinearLayout controls = horizontal(this);
     action = button(this, "检查更新", this::act); spaced(controls, action, 12);
-    cancel = button(this, "取消下载", () -> { updates.cancelDownload(); installWhenReady = false; busy = false; render(); });
+    cancel = button(this, "取消下载", () -> {
+      updates.cancelDownload(); installWhenReady = false; render(); status.setText("已取消下载，可重新下载。");
+      action.requestFocus();
+    });
     spaced(controls, cancel, 12);
     spaced(controls, button(this, "返回", this::finish), 12); page.addView(controls); gap(page, 20);
     page.addView(notes); gap(page, 16);
     page.addView(text(this, "从本项目 GitHub Release 下载 ARM32 安装包；校验大小、SHA-256、包名、版本和签名。\n"
-        + "下载可在后台继续，完成后回到这里安装。普通应用不能静默更新：系统会要求确认，首次可能需要允许安装未知应用。\n"
-        + "更新保留订阅、收藏和历史；签名不一致会拒绝安装，不会引导卸载清除数据。", 14, SECONDARY));
+        + "下载可在后台继续。校验完成会打开系统安装器；按电视提示确认，安装后若没有自动回到映匣，请选择「打开」。\n"
+        + "首次可能需要允许安装未知应用。覆盖安装保留订阅、收藏和历史；签名不一致时不会安装。", 14, SECONDARY));
     render();
-    if (updates.downloadId() < 0 && updates.ready() == null && !waitingPermission) check();
+    if (updates.downloadId() < 0 && updates.ready() == null && !waitingPermission && !installerOpened) check();
     action.requestFocus();
   }
 
   @Override protected void onResume() {
     super.onResume(); resumed = true;
+    if (!alive()) return;
+    if (installerOpened) {
+      installerOpened = false;
+      updates.clearInstallHandoff();
+      status.setText("更新尚未安装，可再次选择安装更新。");
+    }
     handler.post(poll);
     if (!waitingPermission && installWhenReady && !busy && updates.ready() != null) {
       installWhenReady = false; install();
@@ -70,7 +86,9 @@ public final class UpdateActivity extends Activity {
   @Override protected void onPause() { resumed = false; handler.removeCallbacks(poll); super.onPause(); }
   @Override protected void onSaveInstanceState(Bundle state) {
     state.putBoolean("waitingPermission", waitingPermission);
-    state.putBoolean("installWhenReady", installWhenReady); super.onSaveInstanceState(state);
+    state.putBoolean("installWhenReady", installWhenReady);
+    state.putBoolean("installerOpened", installerOpened);
+    super.onSaveInstanceState(state);
   }
   private boolean alive() { return !isFinishing() && !isDestroyed(); }
 
@@ -81,7 +99,7 @@ public final class UpdateActivity extends Activity {
     notes.setText(offered == null ? "" : offered.notes);
     boolean downloading = updates.downloadId() >= 0;
     action.setText(ready != null ? "安装更新" : downloading ? "正在下载…"
-        : offered != null && offered.newerThan(BuildConfig.VERSION_CODE) ? "下载并更新" : "重新检查");
+        : offered != null && offered.newerThan(BuildConfig.VERSION_CODE) ? "下载并安装" : "重新检查");
     action.setEnabled(!busy && !downloading);
     cancel.setVisibility(downloading ? android.view.View.VISIBLE : android.view.View.GONE);
     cancel.setEnabled(!busy);
@@ -120,7 +138,7 @@ public final class UpdateActivity extends Activity {
           AppUpdates.Progress current = updates.progress();
           if (current == null || current.state == DownloadManager.STATUS_FAILED) {
             int reason = current == null ? 0 : current.reason;
-            updates.cancelDownload(); render();
+            updates.cancelDownload(); installWhenReady = false; render();
             status.setText("下载失败（" + reason + "），请检查网络和存储后重试。");
           } else if (current.state == DownloadManager.STATUS_SUCCESSFUL) {
             busy = true; render(); status.setText("下载完成，正在校验安装包…");
@@ -132,11 +150,14 @@ public final class UpdateActivity extends Activity {
                   busy = false; render(); action.requestFocus();
                   if (installWhenReady && resumed) { installWhenReady = false; install(); }
                 });
-              } catch (Exception error) { fail("校验失败：", error); }
+              } catch (Exception error) {
+                runOnUiThread(() -> installWhenReady = false);
+                fail("校验失败：", error);
+              }
             });
           } else {
             if (offered != null && current.bytes > offered.size) {
-              updates.cancelDownload(); render(); status.setText("下载超过预期大小，已停止。");
+              updates.cancelDownload(); installWhenReady = false; render(); status.setText("下载超过预期大小，已停止。");
             } else {
               progress.setIndeterminate(current.total <= 0);
               if (current.total > 0) progress.setProgress((int) Math.min(1000, current.bytes * 1000 / current.total));
@@ -146,7 +167,7 @@ public final class UpdateActivity extends Activity {
             }
           }
         } catch (Exception error) {
-          updates.cancelDownload(); render(); status.setText("无法读取下载状态：" + Json.message(error));
+          updates.cancelDownload(); installWhenReady = false; render(); status.setText("无法读取下载状态：" + Json.message(error));
         }
       }
       if (resumed) handler.postDelayed(this, 1000);
@@ -176,17 +197,26 @@ public final class UpdateActivity extends Activity {
         runOnUiThread(() -> {
           if (!alive()) return;
           busy = false; render();
-          if (!resumed) { status.setText("校验完成，返回页面后选择安装更新。"); return; }
+          if (!resumed) { installWhenReady = true; status.setText("安装包已校验，返回更新页继续安装。"); return; }
           try {
             Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".updates", updates.readyFile());
             Intent intent = new Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             intent.setClipData(ClipData.newRawUri("应用更新", uri));
+            updates.markInstallerOpened(update);
+            installerOpened = true;
+            status.setText("请在系统界面确认安装。安装完成后如未自动返回，请选择「打开」。");
             startActivity(intent);
-            status.setText("请在系统安装界面确认；如果取消，可再次选择安装更新。");
-          } catch (Exception error) { status.setText("无法打开系统安装器：" + Json.message(error)); }
+          } catch (Exception error) {
+            installerOpened = false;
+            updates.clearInstallHandoff();
+            status.setText("无法打开系统安装器：" + Json.message(error));
+          }
         });
-      } catch (Exception error) { fail("无法安装：", error); }
+      } catch (Exception error) {
+        updates.discardReady();
+        fail("安装包复核失败，请重新下载：", error);
+      }
     });
   }
   private void fail(String prefix, Exception error) {

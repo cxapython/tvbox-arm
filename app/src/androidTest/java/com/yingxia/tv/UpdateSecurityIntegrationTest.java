@@ -138,6 +138,21 @@ public final class UpdateSecurityIntegrationTest extends InstrumentationTestCase
     }
     return false;
   }
+  public void testRelaunchRequiresTheExpectedVersionToActuallyBeInstalled() {
+    assertFalse(updates.completedInstall());
+    updates.markInstallerOpened(manifest);
+    assertFalse("Installer launched, but still running the old app", updates.completedInstall());
+    SharedPreferences prefs = context.getSharedPreferences("app_updates", 0);
+    prefs.edit().putInt("installVersion", BuildConfig.VERSION_CODE).commit();
+    assertTrue(updates.completedInstall());
+    updates.clearInstallHandoff();
+    assertFalse("Consumed handoff must not reopen the app again", updates.completedInstall());
+  }
+  public void testStaleInstallHandoffDoesNotRelaunch() {
+    context.getSharedPreferences("app_updates", 0).edit().putInt("installVersion", BuildConfig.VERSION_CODE)
+        .putLong("installStarted", System.currentTimeMillis() - 60 * 60 * 1000).commit();
+    assertFalse(updates.completedInstall());
+  }
   public void testAutomaticCheckIsThrottledAndCanBeDisabled() {
     assertFalse(updates.shouldAutoCheck());
     updates.setAutoCheck(true);
